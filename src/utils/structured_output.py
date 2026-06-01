@@ -1,4 +1,4 @@
-
+﻿
 import re
 import logging
 from typing import Dict, Any, Tuple, List, Optional
@@ -85,6 +85,28 @@ class StructuredOutputGenerator:
     
     
     WEBSITE_PATTERN = re.compile(r'https?://[^\s]+', re.IGNORECASE)
+
+    @staticmethod
+    def _is_noise_company(candidate: str) -> bool:
+        if not candidate:
+            return True
+        lowered = candidate.lower()
+        if len(candidate.split()) > 8:
+            return True
+        noise_terms = {
+            "responsible",
+            "developed",
+            "managed",
+            "implemented",
+            "budgeting",
+            "forecasting",
+            "process",
+            "processes",
+            "duties",
+            "achievements",
+            "projects",
+        }
+        return any(term in lowered for term in noise_terms)
     
     def __init__(self):
         self.logger = logging.getLogger(__name__)
@@ -147,7 +169,7 @@ class StructuredOutputGenerator:
         
         
         category_patterns = {
-            "programming_languages": ['python', 'java', 'javascript', 'c++', 'c#', 'ruby', 'php', 'go', 'rust', 'swift', 'kotlin', 'scala', 'typescript', 'r', 'matlab'],
+            "programming_languages": ['python', 'java', 'javascript', 'c++', 'c#', 'ruby', 'php', 'go', 'rust', 'swift', 'kotlin', 'scala', 'typescript', 'matlab'],
             "frameworks": ['react', 'angular', 'vue', 'django', 'flask', 'spring', 'node', 'express', 'rails', 'laravel', '.net', 'asp.net'],
             "databases": ['sql', 'mysql', 'postgresql', 'mongodb', 'redis', 'elasticsearch', 'oracle', 'sqlite', 'cassandra', 'dynamodb'],
             "tools": ['git', 'docker', 'kubernetes', 'jenkins', 'jira', 'terraform', 'ansible', 'maven', 'gradle', 'npm', 'yarn'],
@@ -161,7 +183,7 @@ class StructuredOutputGenerator:
                 continue
             
             
-            skills = re.split(r'[,;•\n]+', line)
+            skills = re.split(r'[,;â€¢\n]+', line)
             for skill in skills:
                 skill = skill.strip().lower()
                 if not skill or len(skill) < 2:
@@ -172,7 +194,7 @@ class StructuredOutputGenerator:
                 
                 categorized = False
                 for category, keywords in category_patterns.items():
-                    if any(kw in skill for kw in keywords):
+                    if any(re.search(rf'\b{re.escape(kw)}\b', skill) for kw in keywords):
                         categories[category].append(skill)
                         categorized = True
                         break
@@ -206,7 +228,7 @@ class StructuredOutputGenerator:
         ]
         
         
-        year_pattern = re.compile(r'(19|20)\d{2}')
+        year_pattern = re.compile(r'(?:19|20)\d{2}')
         
         for line in lines:
             line = line.strip()
@@ -243,27 +265,92 @@ class StructuredOutputGenerator:
             entries.append(current_entry)
         
         return entries
-    
+
     def parse_experience(self, experience_text: str) -> List[Dict[str, Any]]:
         if not experience_text:
             return []
-        
+
         entries = []
         lines = experience_text.split('\n')
-        
         current_entry = {}
-        
-        
+
         company_patterns = [
-            r'(?:at|@|in|for)\s+([A-Z][A-Za-z\s&,\.]+?)(?:\s*[,]|\s+(?:from|to|present|current|$))',
+            r'\b(?:company|employer|organization)\s*[:\-]\s*([A-Z][A-Za-z0-9&,\.\-\s]{1,60})$',
+            r'@\s*([A-Z][A-Za-z0-9&,\.\-\s]{1,60})$',
+            r'\bat\s+([A-Z][A-Za-z0-9&,\.\-\s]{1,60})(?:\s*(?:\||\-|–|from|to|present|current|$))',
         ]
-        
-        
-        date_pattern = re.compile(r'(?:from|to)?\s*(?:(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*)?(19|20)\d{2}\s*(?:[-–to]+\s*(?:(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*)?(19|20)\d{2}|present|current)?', re.IGNORECASE)
-        
-        
-        title_keywords = ['engineer', 'developer', 'manager', 'analyst', 'designer', 'consultant', 'architect', 'lead', 'director', 'head', 'chief', 'specialist']
-        
+
+        date_pattern = re.compile(
+            r'(?:(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*)?(?:19|20)\d{2}'
+            r'(?:\s*[-–to]+\s*(?:(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*)?'
+            r'(?:19|20)\d{2}|present|current)?',
+            re.IGNORECASE
+        )
+
+        title_keywords = [
+            'engineer', 'developer', 'manager', 'analyst', 'designer',
+            'consultant', 'architect', 'lead', 'director', 'head',
+            'chief', 'specialist', 'executive', 'accountant'
+        ]
+
+        company_suffixes = (
+            'inc', 'llc', 'ltd', 'limited', 'corp', 'corporation',
+            'company', 'technologies', 'solutions', 'services', 'pvt',
+            'bank', 'group', 'consulting'
+        )
+        action_terms = (
+            'responsible', 'developed', 'managed', 'implemented', 'worked',
+            'budgeting', 'forecasting', 'designed', 'led', 'handled'
+        )
+
+        def is_company_like_line(candidate: str) -> bool:
+            cleaned = candidate.strip()
+            if not cleaned or len(cleaned) > 60:
+                return False
+            if re.search(r'\d', cleaned):
+                return False
+            lowered = cleaned.lower()
+            if any(term in lowered for term in action_terms):
+                return False
+            words = cleaned.split()
+            if len(words) > 6:
+                return False
+            if any(lowered.endswith(sfx) or f" {sfx}" in lowered for sfx in company_suffixes):
+                return True
+            titled_words = [w for w in words if w and w[0].isalpha()]
+            if titled_words and all(w[0].isupper() for w in titled_words):
+                return True
+            return False
+
+        def is_probable_entry_start(candidate: str, existing_entry: Dict[str, Any]) -> bool:
+            if not existing_entry:
+                return False
+            lower_candidate = candidate.lower()
+            has_existing_core = any(k in existing_entry for k in ("title", "company", "duration"))
+            if not has_existing_core:
+                return False
+
+            has_title_line = any(keyword in lower_candidate for keyword in title_keywords) and len(candidate) <= 80
+            has_date_line = bool(date_pattern.search(candidate))
+            has_company_header = bool(
+                re.search(r'\b(?:company|employer|organization)\s*[:\-]', candidate, re.IGNORECASE)
+                or re.search(r'@[A-Z]', candidate)
+            )
+
+            if has_date_line:
+                return "duration" in existing_entry and candidate != existing_entry.get("duration", "")
+            if has_title_line:
+                return (
+                    "title" in existing_entry
+                    and candidate != existing_entry.get("title", "")
+                    and ("duration" in existing_entry or "description" in existing_entry or "company" in existing_entry)
+                )
+            if has_company_header:
+                return "company" in existing_entry and candidate != existing_entry.get("company", "")
+            if is_company_like_line(candidate):
+                return "company" in existing_entry and ("duration" in existing_entry or "description" in existing_entry)
+            return False
+
         for line in lines:
             line = line.strip()
             if not line:
@@ -271,56 +358,70 @@ class StructuredOutputGenerator:
                     entries.append(current_entry)
                     current_entry = {}
                 continue
-            
-            
+
+            if is_probable_entry_start(line, current_entry):
+                entries.append(current_entry)
+                current_entry = {}
+
             line_lower = line.lower()
+            consumed = False
             for keyword in title_keywords:
-                if keyword in line_lower and len(line) < 50:
+                if keyword in line_lower and len(line) < 70:
                     current_entry["title"] = line
+                    consumed = True
                     break
-            
-            
-            date_match = date_pattern.search(line)
-            if date_match:
+
+            if date_pattern.search(line):
                 current_entry["duration"] = line
-            
-            
+                consumed = True
+
             for pattern in company_patterns:
                 match = re.search(pattern, line, re.IGNORECASE)
                 if match:
-                    current_entry["company"] = match.group(1).strip()
-            
-            
-            if "title" not in current_entry and "company" not in current_entry:
+                    company_candidate = match.group(1).strip(" -|,")
+                    if not self._is_noise_company(company_candidate):
+                        current_entry["company"] = company_candidate
+                        consumed = True
+                        break
+
+            if (
+                "company" not in current_entry
+                and is_company_like_line(line)
+                and not any(keyword in line_lower for keyword in title_keywords)
+            ):
+                current_entry["company"] = line
+                consumed = True
+
+            if not consumed:
                 if "description" not in current_entry:
                     current_entry["description"] = []
                 current_entry["description"].append(line)
-        
+
         if current_entry:
             entries.append(current_entry)
-        
-        
+
         for entry in entries:
             if "description" in entry and isinstance(entry["description"], list):
                 entry["description"] = " ".join(entry["description"])
-        
+
         return entries
-    
+
     def parse_projects(self, projects_text: str) -> List[Dict[str, Any]]:
         if not projects_text:
             return []
-        
+
         entries = []
         lines = projects_text.split('\n')
-        
+
         current_project = {}
-        
-        
-        tech_pattern = re.compile(r'\b(python|java|javascript|react|angular|vue|node|django|flask|mongodb|mysql|postgresql|aws|azure|gcp|docker|kubernetes)\b', re.IGNORECASE)
-        
-        
+
+        tech_pattern = re.compile(
+            r'\b(python|java|javascript|react|angular|vue|node|django|flask|mongodb|mysql|postgresql|aws|azure|gcp|docker|kubernetes)\b',
+            re.IGNORECASE,
+        )
+
         link_pattern = re.compile(r'(github\.com|gitlab\.com|heroku\.com|aws\.amazon\.com|bitbucket\.org)[^\s]*', re.IGNORECASE)
-        
+
         for line in lines:
             line = line.strip()
             if not line:
@@ -328,33 +429,30 @@ class StructuredOutputGenerator:
                     entries.append(current_project)
                     current_project = {}
                 continue
-            
-            
+
             if len(line) < 60 and not line.startswith('-'):
                 current_project["name"] = line
             else:
-                
                 techs = tech_pattern.findall(line)
                 if techs:
                     if "technologies" not in current_project:
                         current_project["technologies"] = list(set([t.lower() for t in techs]))
-                
+
                 links = link_pattern.findall(line)
                 if links:
                     current_project["link"] = links[0]
-                
+
                 if "description" not in current_project:
                     current_project["description"] = []
                 current_project["description"].append(line)
-        
+
         if current_project:
             entries.append(current_project)
-        
-        
+
         for entry in entries:
             if "description" in entry and isinstance(entry["description"], list):
                 entry["description"] = " ".join(entry["description"])
-        
+
         return entries
     
     def parse_certifications(self, cert_text: str) -> List[Dict[str, Any]]:
@@ -371,7 +469,7 @@ class StructuredOutputGenerator:
             r'\b(certified|certificate)\b.*\b(developer|engineer|architect|manager|professional)\b'
         ]
         
-        year_pattern = re.compile(r'(19|20)\d{2}')
+        year_pattern = re.compile(r'(?:19|20)\d{2}')
         
         for line in lines:
             line = line.strip()
@@ -622,7 +720,5 @@ def generate_structured_resume(
     
     return resume.to_dict()
 
-
 if __name__ == "__main__":
-    
-    test_sections = ""
+    pass

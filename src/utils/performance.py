@@ -170,7 +170,7 @@ def lazy_import_spacy():
 
 def lazy_import_layoutlm():
     try:
-        from layoutlm_extractor import extract_with_layoutlm, is_layoutlm_available
+        from src.extractors.layoutlm_extractor import extract_with_layoutlm, is_layoutlm_available
         return extract_with_layoutlm, is_layoutlm_available
     except ImportError:
         return None, False
@@ -317,13 +317,13 @@ def timeit(func: Callable) -> Callable:
 
 @cache_text_extraction(ttl=1800)  
 def extract_text_cached(pdf_path: str) -> Tuple[str, float]:
-    from text import extract_text_from_pdf
+    from src.utils.text import extract_text_from_pdf
     return extract_text_from_pdf(pdf_path)
 
 
 @cache_section_extraction(ttl=1800)
 def extract_section_cached(text: str, section_type: str, pdf_path: str = None) -> Tuple[str, float]:
-    from section_extractor import extract_section_from_resume
+    from src.utils.section_extractor import extract_section_from_resume
     return extract_section_from_resume(text, section_type, pdf_path)
 
 
@@ -345,7 +345,7 @@ def extract_all_sections_optimized(
     
     
     try:
-        from new_sections import (
+        from src.utils.new_sections import (
             extract_languages_from_resume,
             extract_interests_from_resume,
             extract_achievements_from_resume,

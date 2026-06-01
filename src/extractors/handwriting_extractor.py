@@ -1,5 +1,6 @@
 import os
 import io
+import shutil
 import logging
 from typing import Dict, Any, List, Tuple, Optional
 from dataclasses import dataclass
@@ -13,15 +14,21 @@ Image = None
 cv2 = None
 np = None
 OCR_AVAILABLE = False
+CV2_AVAILABLE = False
 
 try:
     import pytesseract
     from PIL import Image
-    import cv2
-    import numpy as np
     OCR_AVAILABLE = True
 except ImportError as e:
     logger.warning(f"OCR dependencies not available: {e}")
+
+try:
+    import cv2
+    import numpy as np
+    CV2_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"OpenCV dependencies not available: {e}. Preprocessing and handwriting-region detection disabled.")
 
 
 @dataclass
@@ -56,11 +63,31 @@ class HandwritingExtractor:
         self.config = config
         
         if not OCR_AVAILABLE:
-            logger.warning("OCR libraries not available. Install pytesseract, opencv-python, pillow")
+            logger.warning("OCR libraries not available. Install pytesseract and pillow")
             return
             
-        if tesseract_path:
-            pytesseract.pytesseract.tesseract_cmd = tesseract_path
+        resolved_path = tesseract_path or self._resolve_tesseract_path()
+        if resolved_path:
+            pytesseract.pytesseract.tesseract_cmd = resolved_path
+    
+    @staticmethod
+    def _resolve_tesseract_path() -> Optional[str]:
+        env_cmd = os.getenv("TESSERACT_CMD")
+        if env_cmd and os.path.isfile(env_cmd):
+            return env_cmd
+
+        path_cmd = shutil.which("tesseract")
+        if path_cmd:
+            return path_cmd
+
+        common_paths = [
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        ]
+        for cmd in common_paths:
+            if os.path.isfile(cmd):
+                return cmd
+        return None
             
     def is_available(self) -> bool:
         if not OCR_AVAILABLE:
@@ -76,7 +103,7 @@ class HandwritingExtractor:
             return False
     
     def preprocess_image(self, image) -> 'np.ndarray':
-        if np is None:
+        if np is None or cv2 is None:
             return image
             
         
@@ -103,7 +130,7 @@ class HandwritingExtractor:
         return img_erode
     
     def detect_handwriting_regions(self, image) -> HandwritingDetection:
-        if cv2 is None or not self.is_available():
+        if cv2 is None or np is None or not self.is_available():
             return HandwritingDetection(False, 0.0, [])
             
         try:
@@ -191,21 +218,33 @@ class HandwritingExtractor:
             )
             
             
-            confidences = [int(conf) for conf in data.get('confidences', []) if conf != '-1']
-            avg_confidence = sum(confidences) / len(confidences) / 100.0 if confidences else 0.0
+            conf_values: List[float] = []
+            for conf in data.get("conf", []):
+                try:
+                    parsed = float(conf)
+                except (TypeError, ValueError):
+                    continue
+                if parsed >= 0:
+                    conf_values.append(parsed)
+            avg_confidence = sum(conf_values) / len(conf_values) / 100.0 if conf_values else 0.0
             
             
             boxes = []
             n_boxes = len(data['text'])
             for i in range(n_boxes):
-                if int(data['conf'][i]) > 0:
+                try:
+                    word_conf = float(data['conf'][i])
+                except (TypeError, ValueError):
+                    continue
+
+                if word_conf > 0:
                     boxes.append({
                         "text": data['text'][i],
                         "x": data['left'][i],
                         "y": data['top'][i],
                         "width": data['width'][i],
                         "height": data['height'][i],
-                        "confidence": data['conf'][i] / 100.0
+                        "confidence": word_conf / 100.0
                     })
             
             return OCRResult(

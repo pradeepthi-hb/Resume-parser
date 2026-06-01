@@ -1,4 +1,4 @@
-import os
+﻿import os
 import json
 import logging
 import traceback
@@ -46,6 +46,39 @@ def _safe_dict(value: Any) -> Dict[str, Any]:
     if isinstance(value, dict):
         return value
     return {}
+
+
+def _refresh_analysis_summary() -> Dict[str, Any]:
+    try:
+        from src.training.correction_learning import get_correction_pattern_miner
+
+        analysis = get_correction_pattern_miner().run_and_store()
+        return {
+            "total_samples": analysis.get("summary", {}).get("total_samples", 0),
+            "top_problem_fields": analysis.get("top_problem_fields", []),
+        }
+    except Exception as learning_error:
+        logger.error("Could not refresh correction analysis summary: %s", learning_error)
+        return {"total_samples": 0, "top_problem_fields": []}
+
+
+def _refresh_runtime_correction_cache() -> Dict[str, int]:
+    try:
+        from src.utils.correction_storage import refresh_correction_cache
+
+        state = refresh_correction_cache()
+        logger.info(
+            "Runtime correction cache refreshed: fields=%s entries=%s",
+            state.get("fields", 0),
+            state.get("entries", 0),
+        )
+        return {
+            "fields": int(state.get("fields", 0)),
+            "entries": int(state.get("entries", 0)),
+        }
+    except Exception as cache_error:
+        logger.warning("Could not refresh correction cache: %s", cache_error)
+        return {"fields": 0, "entries": 0}
 
 
 @api_features_bp.route("/api/feedback", methods=["POST"])
@@ -152,40 +185,31 @@ def submit_feedback():
                 model_version=data.get("model_version", ""),
                 extraction_context=sample_context,
             )
+            logger.info(
+                "Feedback persisted: feedback_id=%s sample_id=%s field='%s' status=%s type=%s",
+                feedback_id,
+                sample.get("sample_id") if sample else None,
+                field_name,
+                sample_status,
+                feedback_type,
+            )
         except Exception as sample_error:
             logger.warning(f"Could not save to correction learning store: {sample_error}")
         
         stage = "post_save_learning"
-        analysis = {"summary": {"total_samples": 0}, "top_problem_fields": []}
-        retrain_result = {"triggered": False, "reason": "skipped"}
-        try:
-            from src.training.correction_learning import get_correction_pattern_miner, get_auto_retrainer
-            analysis = get_correction_pattern_miner().run_and_store()
-            retrain_result = get_auto_retrainer().maybe_retrain(
-                force=_safe_bool(data.get("force_retrain"), False),
-                deploy=_safe_bool(data.get("auto_deploy"), True),
-            )
-        except Exception as learning_error:
-            logger.error("Feedback saved but retrain workflow failed: %s", learning_error)
-            retrain_result = {
-                "triggered": False,
-                "reason": "post_save_error",
-                "error": str(learning_error),
-            }
+        analysis_summary = _refresh_analysis_summary()
         
         
         collector.mark_as_processed(feedback_id)
+        cache_state = _refresh_runtime_correction_cache()
         
         return jsonify({
             "status": "success",
             "feedback_id": feedback_id,
             "sample_id": sample.get("sample_id") if sample else None,
             "message": "Feedback submitted and saved permanently",
-            "analysis_summary": {
-                "total_samples": analysis.get("summary", {}).get("total_samples", 0),
-                "top_problem_fields": analysis.get("top_problem_fields", []),
-            },
-            "auto_retrain": retrain_result,
+            "analysis_summary": analysis_summary,
+            "cache_state": cache_state,
         })
         
     except Exception as e:
@@ -209,8 +233,6 @@ def submit_feedback_batch():
         from src.utils.feedback_collector import get_feedback_collector
         from src.training.correction_learning import (
             get_correction_learning_store,
-            get_correction_pattern_miner,
-            get_auto_retrainer,
         )
 
         stage = "read_payload"
@@ -227,7 +249,6 @@ def submit_feedback_batch():
         user_id = data.get("user_id")
         session_id = data.get("session_id")
         source = data.get("source", "ui_batch")
-        auto_deploy = _safe_bool(data.get("auto_deploy"), True)
         collector = get_feedback_collector()
         sample_store = get_correction_learning_store()
 
@@ -326,6 +347,15 @@ def submit_feedback_batch():
                     model_version=item.get("model_version", data.get("model_version", "")),
                     extraction_context=sample_context,
                 )
+                logger.info(
+                    "Batch feedback persisted: feedback_id=%s sample_id=%s field='%s' status=%s type=%s item_index=%s",
+                    feedback_id,
+                    sample.get("sample_id"),
+                    field_name,
+                    sample_status,
+                    feedback_type,
+                    idx,
+                )
 
                 stage = f"item_{idx}_mark_processed"
                 collector.mark_as_processed(feedback_id)
@@ -356,34 +386,17 @@ def submit_feedback_batch():
                 "batch_api_version": BATCH_API_VERSION,
             }), 400
 
-        analysis = {"summary": {"total_samples": 0}, "top_problem_fields": []}
-        retrain_result = {"triggered": False, "reason": "skipped"}
-        try:
-            stage = "post_items_analysis"
-            analysis = get_correction_pattern_miner().run_and_store()
-            stage = "post_items_retrain"
-            retrain_result = get_auto_retrainer().maybe_retrain(
-                force=_safe_bool(data.get("force_retrain"), False),
-                deploy=auto_deploy,
-            )
-        except Exception as learning_error:
-            logger.error("Batch feedback saved but retrain workflow failed: %s", learning_error)
-            retrain_result = {
-                "triggered": False,
-                "reason": "post_save_error",
-                "error": str(learning_error),
-            }
+        stage = "post_items_analysis"
+        analysis_summary = _refresh_analysis_summary()
+        cache_state = _refresh_runtime_correction_cache()
 
         return jsonify({
             "status": "success",
             "batch_api_version": BATCH_API_VERSION,
             "saved_count": saved_count,
             "items": processed_items,
-            "analysis_summary": {
-                "total_samples": analysis.get("summary", {}).get("total_samples", 0),
-                "top_problem_fields": analysis.get("top_problem_fields", []),
-            },
-            "auto_retrain": retrain_result,
+            "analysis_summary": analysis_summary,
+            "cache_state": cache_state,
         })
 
     except Exception as e:
@@ -406,8 +419,6 @@ def confirm_extraction():
         from src.utils.feedback_collector import get_feedback_collector
         from src.training.correction_learning import (
             get_correction_learning_store,
-            get_correction_pattern_miner,
-            get_auto_retrainer,
         )
         
         data = request.get_json() or {}
@@ -452,22 +463,22 @@ def confirm_extraction():
             model_version=data.get("model_version", ""),
             extraction_context=sample_context,
         )
-        analysis = get_correction_pattern_miner().run_and_store()
-        retrain_result = get_auto_retrainer().maybe_retrain(
-            force=_safe_bool(data.get("force_retrain"), False),
-            deploy=_safe_bool(data.get("auto_deploy"), True),
+        logger.info(
+            "Confirmation persisted: feedback_id=%s sample_id=%s field='%s'",
+            feedback_id,
+            sample.get("sample_id"),
+            field_name,
         )
+        analysis_summary = _refresh_analysis_summary()
         collector.mark_as_processed(feedback_id)
+        cache_state = _refresh_runtime_correction_cache()
         
         return jsonify({
             "status": "success",
             "feedback_id": feedback_id,
             "sample_id": sample.get("sample_id"),
-            "analysis_summary": {
-                "total_samples": analysis.get("summary", {}).get("total_samples", 0),
-                "top_problem_fields": analysis.get("top_problem_fields", []),
-            },
-            "auto_retrain": retrain_result,
+            "analysis_summary": analysis_summary,
+            "cache_state": cache_state,
         })
         
     except Exception as e:
@@ -481,8 +492,6 @@ def reject_extraction():
         from src.utils.feedback_collector import get_feedback_collector
         from src.training.correction_learning import (
             get_correction_learning_store,
-            get_correction_pattern_miner,
-            get_auto_retrainer,
         )
         
         data = request.get_json() or {}
@@ -528,22 +537,22 @@ def reject_extraction():
             model_version=data.get("model_version", ""),
             extraction_context=sample_context,
         )
-        analysis = get_correction_pattern_miner().run_and_store()
-        retrain_result = get_auto_retrainer().maybe_retrain(
-            force=_safe_bool(data.get("force_retrain"), False),
-            deploy=_safe_bool(data.get("auto_deploy"), True),
+        logger.info(
+            "Rejection persisted: feedback_id=%s sample_id=%s field='%s'",
+            feedback_id,
+            sample.get("sample_id"),
+            field_name,
         )
+        analysis_summary = _refresh_analysis_summary()
         collector.mark_as_processed(feedback_id)
+        cache_state = _refresh_runtime_correction_cache()
         
         return jsonify({
             "status": "success",
             "feedback_id": feedback_id,
             "sample_id": sample.get("sample_id"),
-            "analysis_summary": {
-                "total_samples": analysis.get("summary", {}).get("total_samples", 0),
-                "top_problem_fields": analysis.get("top_problem_fields", []),
-            },
-            "auto_retrain": retrain_result,
+            "analysis_summary": analysis_summary,
+            "cache_state": cache_state,
         })
         
     except Exception as e:
@@ -554,28 +563,21 @@ def reject_extraction():
 @api_features_bp.route("/api/learning/stats", methods=["GET"])
 def get_learning_stats():
     try:
-        from src.utils.continuous_learning import get_continuous_learning
-        from src.training.correction_learning import (
-            get_correction_learning_store,
-            get_auto_retrainer,
-            get_correction_model_engine,
-        )
-        
-        learning = get_continuous_learning()
-        legacy_stats = learning.get_learning_statistics()
+        from src.utils.feedback_collector import get_feedback_collector
+        from src.training.correction_learning import get_correction_learning_store
+
         structured_stats = get_correction_learning_store().get_statistics()
-        retrain_status = get_auto_retrainer().status()
-        correction_model = get_correction_model_engine().get_model_status()
+        feedback_stats = get_feedback_collector().get_statistics()
+        analysis_summary = _refresh_analysis_summary()
         
         return jsonify({
             "status": "success",
             "feedback_mode": DEFAULT_FEEDBACK_MODE,
             "statistics": {
-                "legacy_learning": legacy_stats,
                 "structured_learning": structured_stats,
-                "auto_retraining": retrain_status,
-                "deployed_correction_model": correction_model,
-            }
+                "feedback_storage": feedback_stats,
+            },
+            "analysis_summary": analysis_summary,
         })
         
     except Exception as e:
@@ -586,20 +588,14 @@ def get_learning_stats():
 @api_features_bp.route("/api/learning/pending", methods=["GET"])
 def get_pending_corrections():
     try:
-        from src.utils.continuous_learning import get_continuous_learning
         from src.training.correction_learning import get_correction_learning_store
-        
-        learning = get_continuous_learning()
-        legacy_corrections = learning.get_pending_corrections()
+
         structured_pending = get_correction_learning_store().load_samples(status="pending")
         
         return jsonify({
             "status": "success",
-            "count": len(legacy_corrections) + len(structured_pending),
-            "corrections": {
-                "legacy": legacy_corrections,
-                "structured": structured_pending,
-            }
+            "count": len(structured_pending),
+            "corrections": structured_pending,
         })
         
     except Exception as e:
@@ -610,33 +606,20 @@ def get_pending_corrections():
 @api_features_bp.route("/api/learning/approve/<sample_id>", methods=["POST"])
 def approve_correction(sample_id):
     try:
-        from src.utils.continuous_learning import get_continuous_learning
         from src.training.correction_learning import (
             get_correction_learning_store,
-            get_correction_pattern_miner,
-            get_auto_retrainer,
         )
-        
-        learning = get_continuous_learning()
-        success_legacy = learning.approve_correction(sample_id)
-        success_structured = get_correction_learning_store().update_sample_status(sample_id, "approved")
-        success = success_legacy or success_structured
+
+        success = get_correction_learning_store().update_sample_status(sample_id, "approved")
         
         if success:
-            analysis = get_correction_pattern_miner().run_and_store()
-            data = request.get_json(silent=True) or {}
-            retrain_result = get_auto_retrainer().maybe_retrain(
-                force=_safe_bool(data.get("force_retrain"), False),
-                deploy=_safe_bool(data.get("auto_deploy"), True),
-            )
+            analysis_summary = _refresh_analysis_summary()
+            cache_state = _refresh_runtime_correction_cache()
             return jsonify({
                 "status": "success",
                 "message": "Correction approved",
-                "analysis_summary": {
-                    "total_samples": analysis.get("summary", {}).get("total_samples", 0),
-                    "top_problem_fields": analysis.get("top_problem_fields", []),
-                },
-                "auto_retrain": retrain_result,
+                "analysis_summary": analysis_summary,
+                "cache_state": cache_state,
             })
         else:
             return jsonify({"status": "error", "message": "Correction not found"}), 404
@@ -649,35 +632,21 @@ def approve_correction(sample_id):
 @api_features_bp.route("/api/learning/reject/<sample_id>", methods=["POST"])
 def reject_correction(sample_id):
     try:
-        from src.utils.continuous_learning import get_continuous_learning
         from src.training.correction_learning import (
             get_correction_learning_store,
-            get_correction_pattern_miner,
-            get_auto_retrainer,
         )
         
         data = request.get_json() or {}
-        reason = data.get("reason", "")
-        
-        learning = get_continuous_learning()
-        success_legacy = learning.reject_correction(sample_id, reason)
-        success_structured = get_correction_learning_store().update_sample_status(sample_id, "rejected")
-        success = success_legacy or success_structured
+        success = get_correction_learning_store().update_sample_status(sample_id, "rejected")
         
         if success:
-            analysis = get_correction_pattern_miner().run_and_store()
-            retrain_result = get_auto_retrainer().maybe_retrain(
-                force=_safe_bool(data.get("force_retrain"), False),
-                deploy=_safe_bool(data.get("auto_deploy"), True),
-            )
+            analysis_summary = _refresh_analysis_summary()
+            cache_state = _refresh_runtime_correction_cache()
             return jsonify({
                 "status": "success",
                 "message": "Correction rejected",
-                "analysis_summary": {
-                    "total_samples": analysis.get("summary", {}).get("total_samples", 0),
-                    "top_problem_fields": analysis.get("top_problem_fields", []),
-                },
-                "auto_retrain": retrain_result,
+                "analysis_summary": analysis_summary,
+                "cache_state": cache_state,
             })
         else:
             return jsonify({"status": "error", "message": "Correction not found"}), 404
@@ -722,7 +691,6 @@ def backfill_structured_learning():
             normalize_text,
             get_correction_learning_store,
             get_correction_pattern_miner,
-            get_auto_retrainer,
         )
 
         data = request.get_json() or {}
@@ -807,10 +775,7 @@ def backfill_structured_learning():
                     inserted += 1
 
         analysis = get_correction_pattern_miner().run_and_store()
-        retrain_result = get_auto_retrainer().maybe_retrain(
-            force=_safe_bool(data.get("force_retrain"), False),
-            deploy=_safe_bool(data.get("auto_deploy"), True),
-        )
+        cache_state = _refresh_runtime_correction_cache()
 
         return jsonify({
             "status": "success",
@@ -820,7 +785,7 @@ def backfill_structured_learning():
                 "total_samples": analysis.get("summary", {}).get("total_samples", 0),
                 "top_problem_fields": analysis.get("top_problem_fields", []),
             },
-            "auto_retrain": retrain_result,
+            "cache_state": cache_state,
         })
 
     except Exception as e:
@@ -828,40 +793,44 @@ def backfill_structured_learning():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-@api_features_bp.route("/api/model/auto-retrain/status", methods=["GET"])
-def auto_retrain_status():
+@api_features_bp.route("/api/learning/confidence-calibration", methods=["GET"])
+def get_confidence_calibration():
     try:
-        from src.training.correction_learning import get_auto_retrainer
+        from src.training.correction_learning import get_confidence_calibrator
 
-        status = get_auto_retrainer().status()
+        profile = get_confidence_calibrator().build_calibration_profile()
         return jsonify({
             "status": "success",
-            "auto_retrain": status,
+            "profile": profile,
         })
-
     except Exception as e:
-        logger.error("Error getting auto-retrain status: %s", e)
+        logger.error("Error getting confidence calibration profile: %s", e)
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@api_features_bp.route("/api/model/auto-retrain/status", methods=["GET"])
+def auto_retrain_status():
+    return jsonify({
+        "status": "success",
+        "auto_retrain": {
+            "ready": False,
+            "triggered": False,
+            "reason": "disabled",
+            "message": "Correction replay auto-retraining is disabled.",
+        },
+    })
 
 
 @api_features_bp.route("/api/model/auto-retrain", methods=["POST"])
 def run_auto_retrain():
-    try:
-        from src.training.correction_learning import get_auto_retrainer
-
-        data = request.get_json() or {}
-        result = get_auto_retrainer().maybe_retrain(
-            force=_safe_bool(data.get("force"), True),
-            deploy=_safe_bool(data.get("deploy"), True),
-        )
-        return jsonify({
-            "status": "success",
-            "result": result,
-        })
-
-    except Exception as e:
-        logger.error("Error running auto retrain: %s", e)
-        return jsonify({"status": "error", "message": str(e)}), 500
+    return jsonify({
+        "status": "success",
+        "result": {
+            "triggered": False,
+            "reason": "disabled",
+            "message": "Correction replay retraining is disabled.",
+        },
+    })
 
 
 
@@ -872,7 +841,6 @@ def run_auto_retrain():
 def train_model():
     try:
         from src.training.trainer import get_model_trainer, TrainingConfig
-        from src.training.correction_learning import get_correction_model_trainer
         
         data = request.get_json() or {}
         
@@ -881,28 +849,9 @@ def train_model():
 
         model_type = str(data.get("model_type", "spacy")).strip().lower()
         if model_type in {"correction", "correction-rules", "postprocessor"}:
-            correction_trainer = get_correction_model_trainer()
-            result = correction_trainer.train_and_register(
-                min_samples=int(data.get("min_samples", 10)),
-                min_rule_support=int(data.get("min_rule_support", 1)),
-                low_confidence_threshold=_safe_float(
-                    data.get("low_confidence_threshold", LOW_CONFIDENCE_THRESHOLD),
-                    LOW_CONFIDENCE_THRESHOLD,
-                ),
-                min_similarity=_safe_float(data.get("min_similarity", 0.9), 0.9),
-                deploy=_safe_bool(data.get("deploy"), True),
-            )
-
-            if result.get("success"):
-                return jsonify({
-                    "status": "success",
-                    "message": "Correction model training completed",
-                    "result": result,
-                })
             return jsonify({
                 "status": "error",
-                "message": result.get("message", "Correction training failed"),
-                "result": result,
+                "message": "Correction replay model training is disabled. Use /api/learning/error-analysis for parser-improvement feedback.",
             }), 400
         
         config = TrainingConfig(
@@ -945,11 +894,7 @@ def model_status():
     try:
         from src.training.trainer import get_model_trainer
         from src.training.data_preparator import get_data_preparator
-        from src.training.correction_learning import (
-            get_correction_learning_store,
-            get_auto_retrainer,
-            get_correction_model_engine,
-        )
+        from src.training.correction_learning import get_correction_learning_store
         
         trainer = get_model_trainer()
         preparator = get_data_preparator()
@@ -964,8 +909,6 @@ def model_status():
             data_stats = {}
 
         correction_data_stats = get_correction_learning_store().get_statistics()
-        auto_retrain = get_auto_retrainer().status()
-        correction_model = get_correction_model_engine().get_model_status()
         
         return jsonify({
             "status": "success",
@@ -973,15 +916,13 @@ def model_status():
             "available_models": models,
             "training_data_stats": data_stats,
             "structured_correction_data_stats": correction_data_stats,
-            "auto_retraining": auto_retrain,
-            "deployed_correction_model": correction_model,
             "features": {
                 "spacy_training": True,
                 "transformer_training": True,
                 "custom_ner": True,
                 "feedback_based_training": True,
-                "correction_model_training": True,
-                "periodic_retraining": True,
+                "correction_model_training": False,
+                "periodic_retraining": False,
             }
         })
         
@@ -1043,8 +984,14 @@ def deploy_model():
         if not data:
             data = {}
 
-        model_name = data.get("model_name", "correction_postprocessor")
+        model_name = data.get("model_name", "resume_model")
         version_id = data.get("version_id")
+
+        if str(model_name).strip().lower() == "correction_postprocessor":
+            return jsonify({
+                "status": "error",
+                "message": "Correction replay model deployment is disabled.",
+            }), 400
         
         registry = get_model_registry()
         if not version_id:

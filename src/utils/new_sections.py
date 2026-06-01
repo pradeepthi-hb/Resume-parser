@@ -1,5 +1,6 @@
 import re
 import logging
+from src.utils.headings import canonicalize_heading
 
 
 logging.basicConfig(level=logging.INFO)
@@ -7,43 +8,8 @@ logger = logging.getLogger(__name__)
 
 
 
-_CORRECTION_ENGINE = None
-
-
-def _get_correction_engine():
-    global _CORRECTION_ENGINE
-    if _CORRECTION_ENGINE is None:
-        try:
-            from src.training.correction_learning import get_correction_model_engine
-            _CORRECTION_ENGINE = get_correction_model_engine()
-        except Exception as e:
-            logging.getLogger(__name__).warning(f"Could not load correction engine: {e}")
-    return _CORRECTION_ENGINE
-
-
 def _apply_corrections(field_name: str, value: str, confidence: float):
-    if not value:
-        return value, confidence
-    
-    engine = _get_correction_engine()
-    if engine is None:
-        return value, confidence
-    
-    try:
-        result = engine.apply(
-            field_name=field_name,
-            value=value,
-            confidence=confidence,
-            force=False
-        )
-        
-        if result.get("applied"):
-            logging.info(f"Applied correction for '{field_name}': {result.get('reason')}")
-            return result.get("corrected_value"), result.get("confidence", confidence)
-        
-    except Exception as e:
-        logging.getLogger(__name__).warning(f"Error applying corrections: {e}")
-    
+    # Runtime correction replay is intentionally disabled in section extractors.
     return value, confidence
 
 
@@ -183,7 +149,8 @@ INTERESTS_HEADERS = [
 
 INTERESTS_STOP_KEYWORDS = [
     "skills", "education", "experience", "projects", "certifications",
-    "summary", "references", "declaration", "languages"
+    "summary", "references", "declaration", "languages",
+    "personal profile", "languages known", "email", "mobile", "contact"
 ]
 
 
@@ -280,7 +247,9 @@ ACHIEVEMENTS_HEADERS = [
 
 ACHIEVEMENTS_STOP_KEYWORDS = [
     "skills", "education", "experience", "projects", "certifications",
-    "summary", "references", "declaration", "languages", "interests"
+    "summary", "references", "declaration", "languages", "interests",
+    "professional experience", "work experience", "employment history",
+    "tools & technologies", "tools and technologies", "additional information"
 ]
 
 
@@ -624,14 +593,17 @@ SKILLS_SECTION_PATTERNS = [
 def _is_skills_section_header(line: str) -> bool:
     """Check if a line is a skills section header."""
     line_lower = line.lower().strip()
+    canonical = canonicalize_heading(line)
+    if canonical and canonical != "summary":
+        return True
     
     # Check exact matches
     if line_lower in SUMMARY_STOP_KEYWORDS:
         return True
     
-    # Check startswith
+    # Check heading-like startswith (avoid stopping on prose sentences)
     for stop in SUMMARY_STOP_KEYWORDS:
-        if line_lower.startswith(stop):
+        if re.match(rf'^{re.escape(stop)}\s*[:\-â€“â€”]?\s*$', line_lower):
             return True
     
     # Check regex patterns
@@ -716,13 +688,9 @@ def extract_summary_from_resume(text: str) -> tuple:
         
         if capture and header_found:
             should_stop = False
-            for stop in SUMMARY_STOP_KEYWORDS:
-                if line_lower.startswith(stop) or re.match(rf'^{re.escape(stop)}[\s:\-–—]+', line_lower):
-                    should_stop = True
-                    break
-                if line_lower == stop:
-                    should_stop = True
-                    break
+            heading_key = canonicalize_heading(line_stripped)
+            if heading_key and heading_key != "summary":
+                should_stop = True
             
             # Also check for skills section headers using the extended pattern detection
             if not should_stop and _is_skills_section_header(line_stripped):
@@ -735,6 +703,28 @@ def extract_summary_from_resume(text: str) -> tuple:
             summary_lines.append(line_stripped)
     
     
+    if not summary_lines:
+        fallback_lines = []
+        for line in lines[:60]:
+            line_stripped = line.strip()
+            if not line_stripped:
+                if fallback_lines:
+                    break
+                continue
+            if canonicalize_heading(line_stripped):
+                if fallback_lines:
+                    break
+                continue
+            line_lower = line_stripped.lower()
+            if "@" in line_lower or re.search(r'\+?\d[\d\s\-\(\)]{8,}', line_lower):
+                continue
+            if len(line_stripped.split()) < 4:
+                continue
+            fallback_lines.append(line_stripped)
+            if len(" ".join(fallback_lines)) >= 320:
+                break
+        summary_lines = fallback_lines
+
     summary_text = " ".join(summary_lines)
     confidence = calculate_summary_confidence(summary_text, text)
     

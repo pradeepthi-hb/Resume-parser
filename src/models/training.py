@@ -10,7 +10,8 @@ TRAINING_HEADERS = [
     "training", "trainings", "workshops", "seminars", "courses", 
     "professional development", "training & development", "training programs",
     "workshops & seminars", "training courses", "corporate training",
-    "skill development", "learning & development"
+    "skill development", "learning & development", "trainings attended",
+    "internship", "internships"
 ]
 
 

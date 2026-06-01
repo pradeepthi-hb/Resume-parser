@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 EDUCATION_HEADERS = [
     "education", "education qualification", "educational qualifications",
     "academic qualifications", "education & qualifications", "education details",
-    "education background", "academic background", "educational profile",
+    "education background", "educational background", "academic background", "educational profile",
     "educational summary", "academic credentials", "qualification", "qualifications",
     "academic details", "education details", "degree", "degrees"
 ]
@@ -18,7 +18,8 @@ EDUCATION_HEADERS = [
 STOP_KEYWORDS = [
     "skills", "projects", "certifications", "experience", "summary",
     "about", "technical skills", "work experience", "employment",
-    "internships", "projects", "achievements", "awards"
+    "internships", "projects", "achievements", "awards",
+    "objective", "career objective", "project details", "training", "trainings attended"
 ]
 
 

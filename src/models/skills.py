@@ -31,8 +31,36 @@ STOP_KEYWORDS = [
     "career objective", "introduction", "contact", "achievements",
     "awards", "publications", "volunteer experience", "internships",
     "work experience", "employment", "professional experience",
-    "awards & achievements"
+    "awards & achievements", "training", "trainings attended",
+    "educational background", "education background", "project details",
+    "personal profile", "languages known", "internship"
 ]
+
+ROLE_ORG_PATTERN = re.compile(
+    r"\b(assistant|accountant|engineer|developer|manager|analyst|executive|specialist|intern|co\.|ltd|llp|inc)\b",
+    re.IGNORECASE,
+)
+DATE_PATTERN = re.compile(r"\b(?:19|20)\d{2}\b|(?:\d{1,2}/\d{4}\s*[-–]\s*\d{1,2}/\d{4})", re.IGNORECASE)
+SENTENCE_VERB_PATTERN = re.compile(
+    r"\b(reviewed|managed|assisted|supported|developed|implemented|coordinated|authored|prepared|drafted|collaborated|achieved|reducing|improving)\b",
+    re.IGNORECASE,
+)
+SKILLS_HEADING_NOISE = {"key achievements", "achievements", "core competencies", "languages", "education", "experience"}
+SKILLS_AWARD_NOISE_PATTERN = re.compile(r"\b(success|boost|excellence|award|winner|achiev)\b", re.IGNORECASE)
+ALLOWED_SINGLE_WORD_SKILLS = {
+    "budgeting",
+    "forecasting",
+    "regulatory",
+    "compliance",
+    "taxation",
+    "auditing",
+    "accounting",
+    "analysis",
+    "excel",
+    "python",
+    "java",
+    "sql",
+}
 
 
 def get_skills_keywords():
@@ -66,6 +94,70 @@ def calculate_skills_confidence(skills_text, original_text):
         confidence = min(confidence * 1.2, 1.0)
     
     return round(min(confidence, 1.0), 2)
+
+
+def _normalize_skill_line(line: str) -> str:
+    line = line.strip()
+    line = line.replace("\ue01c", "").strip()
+    line = re.sub(r"\s{2,}", " ", line)
+    return line
+
+
+def _looks_like_skill_line(line: str) -> bool:
+    if not line or len(line) < 2:
+        return False
+
+    line = _normalize_skill_line(line)
+    lower = line.lower()
+    words = line.split()
+    lowered_clean = re.sub(r"[^a-z ]", "", lower).strip()
+
+    if lowered_clean in SKILLS_HEADING_NOISE:
+        return False
+
+    if DATE_PATTERN.search(line):
+        return False
+
+    if SKILLS_AWARD_NOISE_PATTERN.search(lower):
+        return False
+
+    if ROLE_ORG_PATTERN.search(lower):
+        return False
+
+    if SENTENCE_VERB_PATTERN.search(lower):
+        return False
+
+    if line.startswith("- ") and len(words) > 8:
+        return False
+
+    # Long prose sentences are rarely skills.
+    if len(words) > 10 and ":" not in line:
+        return False
+
+    if "," in line and ":" not in line and len(words) > 3:
+        return False
+
+    if "." in line and ":" not in line:
+        return False
+
+    if line.endswith((".", ";")):
+        return False
+
+    if len(words) == 1:
+        token = re.sub(r"[^A-Za-z]", "", words[0])
+        token_lower = token.lower()
+        if token_lower not in ALLOWED_SINGLE_WORD_SKILLS and re.match(r"^[A-Z][a-z]+$", token):
+            return False
+
+    # Keep category lines (e.g., "Languages: Java, C")
+    if ":" in line:
+        return True
+
+    # Keep short competency phrases.
+    if len(words) <= 7:
+        return True
+
+    return False
 
 
 def extract_skills_from_resume(text):
@@ -120,9 +212,15 @@ def extract_skills_from_resume(text):
                 if line_lower == stop:
                     should_stop = True
                     break
+
+                if stop in line_lower and len(line_lower) < 40:
+                    should_stop = True
+                    break
             
             if should_stop:
-                break
+                capture = False
+                header_found = False
+                continue
         
         
         if capture and header_found and line_stripped and not re.fullmatch(r"-{4,}", line_stripped):
@@ -138,9 +236,19 @@ def extract_skills_from_resume(text):
         if separator_pattern.match(line):
             continue
         
-        if line not in seen:
-            cleaned.append(line)
-            seen.add(line)
+        normalized = _normalize_skill_line(line)
+        if normalized.startswith("& ") and cleaned:
+            cleaned[-1] = f"{cleaned[-1]} {normalized}".strip()
+            seen.add(cleaned[-1].lower())
+            continue
+
+        if not _looks_like_skill_line(normalized):
+            continue
+
+        key = normalized.lower()
+        if key not in seen:
+            cleaned.append(normalized)
+            seen.add(key)
 
     skills_text = "\n".join(cleaned)
     

@@ -1,4 +1,4 @@
-
+﻿
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
 
 
@@ -252,13 +252,14 @@ body {
 }
 
 .main-content.two-column-view {
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
 }
 
 .left-column {
     display: flex;
     flex-direction: column;
     gap: 20px;
+    min-width: 0;
 }
 
 .center-column {
@@ -271,6 +272,7 @@ body {
     display: flex;
     flex-direction: column;
     gap: 20px;
+    min-width: 0;
 }
 
 
@@ -279,6 +281,7 @@ body {
     border-radius: var(--radius-xl);
     box-shadow: var(--shadow-lg);
     padding: 24px;
+    min-width: 0;
 }
 
 .upload-card-title {
@@ -564,6 +567,18 @@ body {
     word-wrap: break-word;
     max-height: 400px;
     overflow-y: auto;
+    overflow-x: auto;
+}
+
+.results-content .page {
+    width: 100% !important;
+    max-width: 100% !important;
+    box-sizing: border-box;
+}
+
+.results-content .layout-content {
+    max-width: 100%;
+    overflow-x: auto;
 }
 
 
@@ -1031,7 +1046,7 @@ body {
     min-width: 120px;
 }
 
-.section-content {
+.sections-table .section-content {
     color: var(--gray-600);
     font-family: 'JetBrains Mono', monospace;
     font-size: 0.8rem;
@@ -1046,18 +1061,18 @@ body {
     overflow-y: auto;
 }
 
-.section-content:hover {
+.sections-table .section-content:hover {
     background: var(--gray-50);
 }
 
-.section-content.editing {
+.sections-table .section-content.editing {
     border-color: var(--primary);
     background: var(--white);
     outline: none;
     box-shadow: 0 0 0 3px var(--primary-light);
 }
 
-.section-content.modified {
+.sections-table .section-content.modified {
     border-color: var(--warning);
     background: #fffbeb;
 }
@@ -1333,6 +1348,7 @@ body {
 .table-view-content .sections-table {
     width: 100%;
     font-size: 0.8rem;
+    table-layout: auto;
 }
 
 .table-view-content .sections-table th {
@@ -1345,13 +1361,35 @@ body {
 }
 
 .table-view-content .section-name {
+    width: 14%;
     min-width: 80px;
     font-size: 0.75rem;
 }
 
 .table-view-content .section-content {
-    max-width: 150px;
+    width: 100%;
+    max-width: none;
     font-size: 0.7rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-x: hidden;
+    max-height: none;
+    overflow-y: visible;
+    display: block;
+}
+
+.table-view-content .correction-cell {
+    width: 20%;
+    min-width: 100px;
+}
+
+.table-view-content .confidence-cell {
+    width: 10%;
+    min-width: 70px;
+}
+
+.table-view-content .correction-input {
+    min-width: 0;
 }
 
 
@@ -1367,10 +1405,59 @@ body {
     margin: 0 0 10px 0;
 }
 
+.extraction-split-view-right .layout-content,
+.extraction-split-view-right .layout-content * {
+    font-family: "Times New Roman", Times, serif !important;
+}
+
+.extraction-split-view-right .layout-content {
+    background: #fff;
+    color: var(--gray-800);
+    line-height: 1.5;
+}
+
+.extraction-split-view-right .layout-content .page {
+    width: 100%;
+    max-width: 100%;
+    min-height: auto;
+    margin: 0;
+    padding: 10px 12px;
+    box-shadow: none;
+    border-radius: 0;
+    background: transparent;
+}
+
+.extraction-split-view-right .layout-content .resume-content {
+    line-height: 1.5;
+}
+
+.extraction-split-view-right .layout-content .section-title {
+    font-size: 0.95rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    border-bottom: 1px solid var(--gray-300);
+    margin: 10px 0 6px 0;
+    padding-bottom: 2px;
+}
+
 .extraction-split-view-right .layout-content .heading {
     font-weight: 600;
     color: var(--gray-800);
     
+}
+
+.extraction-split-view-right .layout-content .section-content {
+    max-width: 100%;
+    max-height: none;
+    overflow: visible;
+    border: none;
+    padding: 2px 0;
+    border-radius: 0;
+    font-family: inherit;
+    font-size: 0.95rem;
+    line-height: 1.5;
+    color: var(--gray-800);
+    background: transparent;
 }
 
 .extraction-split-view-right .layout-content .subheading {
@@ -1401,4 +1488,5 @@ body {
     font-weight: 600;
     padding: 6px 12px;
 }
+
 

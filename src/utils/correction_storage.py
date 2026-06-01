@@ -1,152 +1,131 @@
-import os
 import logging
-from typing import Dict, Any, Optional, List
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
 
-class CorrectionStorage:
-    
-    def __init__(self):
-        self._cached_corrections: Dict[str, Dict[str, str]] = {}
-        self._cache_loaded = False
-    
-    def _load_corrections(self) -> Dict[str, Dict[str, str]]:
-        if self._cache_loaded:
-            return self._cached_corrections
-        
-        corrections: Dict[str, Dict[str, str]] = {}
-        
-        try:
-            from src.training.correction_learning import (
-                get_correction_learning_store,
-                normalize_text,
-                _guess_field,
-            )
-            
-            store = get_correction_learning_store()
-            
-            
-            samples = store.load_samples(status="approved", only_changed=True)
-            
-            logger.info(f"Loading {len(samples)} correction samples from store")
-            
-            for sample in samples:
-                field = _guess_field(sample.get("field_name", ""))
-                original = normalize_text(sample.get("original_value", ""))
-                corrected = sample.get("corrected_value", "")
-                
-                if not original or not corrected:
-                    continue
-                
-                
-                if field not in corrections:
-                    corrections[field] = {}
-                
-                
-                original_raw = sample.get("original_value", "")
-                corrections[field][original_raw.lower()] = corrected
-            
-            self._cached_corrections = corrections
-            self._cache_loaded = True
-            
-            logger.info(f"Loaded corrections for {len(corrections)} fields: {list(corrections.keys())}")
-            
-        except Exception as e:
-            logger.warning(f"Error loading corrections from store: {e}")
-            
-            try:
-                base_dir = os.path.dirname(os.path.dirname(__file__))
-                jsonl_path = os.path.join(base_dir, "learning_data", "structured_corrections.jsonl")
-                
-                if os.path.exists(jsonl_path):
-                    import json
-                    with open(jsonl_path, "r", encoding="utf-8") as f:
-                        for line in f:
-                            if not line.strip():
-                                continue
-                            try:
-                                sample = json.loads(line)
-                                if sample.get("status") != "approved":
-                                    continue
-                                if sample.get("feedback_type") == "rejection":
-                                    continue
-                                
-                                field = _guess_field(sample.get("field_name", ""))
-                                original = sample.get("original_value", "")
-                                corrected = sample.get("corrected_value", "")
-                                
-                                if not original or not corrected:
-                                    continue
-                                
-                                if field not in corrections:
-                                    corrections[field] = {}
-                                
-                                corrections[field][original.lower()] = corrected
-                            except:
-                                continue
-                    
-                    self._cached_corrections = corrections
-                    self._cache_loaded = True
-                    logger.info(f"Loaded corrections from fallback: {len(corrections)} fields")
-            except Exception as fallback_error:
-                logger.warning(f"Fallback also failed: {fallback_error}")
-        
-        return corrections
-    
-    def invalidate_cache(self):
-        self._cached_corrections = {}
-        self._cache_loaded = False
-        logger.info("Correction cache invalidated")
-    
-    def get_corrections_dict(self, field_name: str) -> Dict[str, str]:
-        corrections = self._load_corrections()
-        field = field_name.lower().strip()
-        
-        
-        if field in corrections:
-            return corrections[field]
-        
-        
-        for key, value in corrections.items():
-            if field in key or key in field:
-                return value
-        
-        return {}
-    
-    def get_all_corrections(self) -> Dict[str, Dict[str, str]]:
-        return self._load_corrections()
-    
-    def apply_correction(self, field_name: str, value: str) -> Optional[str]:
-        if not value:
-            return None
-        
-        corrections = self.get_corrections_dict(field_name)
-        value_lower = value.lower().strip()
-        
-        
-        if value_lower in corrections:
-            corrected = corrections[value_lower]
-            logger.info(f"Applied correction for '{field_name}': '{value}' -> '{corrected}'")
-            return corrected
-        
-        
-        for original, corrected in corrections.items():
-            if original in value_lower or value_lower in original:
-                logger.info(f"Applied fuzzy correction for '{field_name}': '{value}' -> '{corrected}'")
-                return corrected
-        
-        return None
-    
-    def has_corrections(self, field_name: Optional[str] = None) -> bool:
-        corrections = self._load_corrections()
-        
-        if field_name is None:
-            return len(corrections) > 0
-        
-        field = field_name.lower().strip()
-        return field in corrections and len(corrections[field]) > 0
+def _normalize(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).replace("\x00", " ").strip().lower().split())
 
+
+class CorrectionStorage:
+    """
+    Safe correction storage: deterministic exact normalized matches only.
+
+    This intentionally avoids fuzzy/runtime text replacement behavior.
+    """
+
+    def __init__(self):
+        self._cache: Dict[str, Dict[str, str]] = {}
+        self._cache_key: Optional[str] = None
+
+    def _load_if_needed(self) -> None:
+        from src.training.correction_learning import get_correction_learning_store
+
+        store = get_correction_learning_store()
+        try:
+            mtime = 0.0
+            if store.samples_path:
+                import os
+
+                if os.path.exists(store.samples_path):
+                    mtime = os.path.getmtime(store.samples_path)
+            cache_key = f"{store.samples_path}|{mtime}"
+        except Exception:
+            cache_key = "fallback"
+
+        if self._cache_key == cache_key and self._cache:
+            logger.debug("Safe correction cache reused (key=%s)", cache_key)
+            return
+
+        corrections_map = store.build_safe_corrections_map()
+        self._cache = corrections_map
+        self._cache_key = cache_key
+        logger.info(
+            "Safe correction cache loaded: fields=%s total_entries=%s",
+            len(self._cache),
+            sum(len(v) for v in self._cache.values()),
+        )
+
+    def invalidate_cache(self) -> None:
+        self._cache = {}
+        self._cache_key = None
+        logger.info("Safe correction cache invalidated")
+
+    def _field_key(self, field_name: str) -> str:
+        return _normalize(field_name) or "unknown"
+
+    def get_corrections_dict(self, field_name: str) -> Dict[str, str]:
+        self._load_if_needed()
+        return self._cache.get(self._field_key(field_name), {})
+
+    def get_all_corrections(self) -> Dict[str, Dict[str, str]]:
+        self._load_if_needed()
+        return self._cache
+
+    def find_best_correction(self, field_name: str, value: str) -> Optional[Dict[str, str]]:
+        if value is None:
+            logger.info("Correction lookup skipped: value=None field=%s", field_name)
+            return None
+
+        self._load_if_needed()
+        normalized_field = self._field_key(field_name)
+        field_map = self._cache.get(normalized_field, {})
+        normalized_value = _normalize(value)
+        logger.info(
+            "Correction lookup: field_raw='%s' field_norm='%s' value_norm='%s' field_entries=%s cache_fields=%s cache_key=%s",
+            field_name,
+            normalized_field,
+            normalized_value[:180],
+            len(field_map),
+            len(self._cache),
+            self._cache_key,
+        )
+        if not normalized_value:
+            logger.info("Correction lookup miss: empty normalized value for field_norm='%s'", normalized_field)
+            return None
+
+        corrected = field_map.get(normalized_value)
+        if not corrected:
+            logger.info(
+                "Correction lookup miss: no exact normalized key for field_norm='%s' lookup_key='%s'",
+                normalized_field,
+                normalized_value[:180],
+            )
+            return None
+
+        if _normalize(corrected) == normalized_value:
+            logger.info(
+                "Correction lookup skipped: corrected value normalizes to same key for field_norm='%s'",
+                normalized_field,
+            )
+            return None
+
+        logger.info(
+            "Correction lookup hit: field_norm='%s' lookup_key='%s' corrected='%s'",
+            normalized_field,
+            normalized_value[:180],
+            corrected[:180],
+        )
+        return {
+            "match_type": "exact_normalized",
+            "matched_original": value,
+            "corrected_value": corrected,
+        }
+
+    def apply_correction(self, field_name: str, value: str) -> Optional[str]:
+        match = self.find_best_correction(field_name, value)
+        if not match:
+            return None
+        return match.get("corrected_value")
+
+    def has_corrections(self, field_name: Optional[str] = None) -> bool:
+        self._load_if_needed()
+        if field_name is None:
+            return any(self._cache.values())
+        return bool(self._cache.get(self._field_key(field_name), {}))
 
 
 _correction_storage: Optional[CorrectionStorage] = None
@@ -159,6 +138,15 @@ def get_correction_storage() -> CorrectionStorage:
     return _correction_storage
 
 
-def invalidate_correction_cache():
+def invalidate_correction_cache() -> None:
+    get_correction_storage().invalidate_cache()
+
+
+def refresh_correction_cache() -> Dict[str, Any]:
     storage = get_correction_storage()
     storage.invalidate_cache()
+    data = storage.get_all_corrections()
+    return {
+        "fields": len(data),
+        "entries": sum(len(v) for v in data.values()),
+    }

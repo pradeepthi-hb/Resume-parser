@@ -114,52 +114,9 @@ class DataPreparator:
         self,
         field_name: Optional[str] = None
     ) -> List[TrainingExample]:
-        examples = []
-        
-        
-        learning_dir = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)),
-            'learning_data'
-        )
-        
-        if not os.path.exists(learning_dir):
-            return examples
-            
-        for filename in os.listdir(learning_dir):
-            if not filename.endswith('.json') or not filename.startswith('sample_'):
-                continue
-                
-            filepath = os.path.join(learning_dir, filename)
-            try:
-                with open(filepath, 'r') as f:
-                    data = json.load(f)
-                    
-                
-                if data.get('status') != 'approved':
-                    continue
-                    
-                if field_name and data.get('field_name') != field_name:
-                    continue
-                    
-                example = TrainingExample(
-                    input_text=data.get('original_extraction', ''),
-                    output_text=data.get('corrected_extraction', ''),
-                    field=data.get('field_name', ''),
-                    metadata={
-                        "confidence_before": data.get('confidence_before', 0),
-                        "confidence_after": data.get('confidence_after', 0),
-                        "timestamp": data.get('timestamp', '')
-                    },
-                    source="feedback",
-                    verified=True
-                )
-                
-                examples.append(example)
-                
-            except Exception as e:
-                logger.error(f"Error loading sample {filename}: {e}")
-                
-        return examples
+        # Legacy `sample_*.json` based correction storage has been retired.
+        # Structured corrections from `structured_corrections.jsonl` are used instead.
+        return []
 
     def load_structured_corrections(
         self,
@@ -415,10 +372,6 @@ class DataPreparator:
         
         examples.extend(self.load_feedback_data(field))
         
-        
-        examples.extend(self.load_approved_corrections(field))
-
-
         examples.extend(self.load_structured_corrections(field, only_changed=True))
         
         
@@ -464,7 +417,6 @@ class DataPreparator:
         
         sources = [
             self.load_feedback_data,
-            self.load_approved_corrections,
             self.load_structured_corrections,
         ]
         

@@ -6,3 +6,5 @@ node_modules/
 instance/
 uploads/
 *.db
+feedback/
+docs

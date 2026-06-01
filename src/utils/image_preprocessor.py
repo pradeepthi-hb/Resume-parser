@@ -1,7 +1,7 @@
 import os
 import io
 import logging
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 
 logger = logging.getLogger(__name__)
 

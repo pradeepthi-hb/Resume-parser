@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="en">
 
 <head>
@@ -168,10 +168,11 @@
 
         const headingToSectionMap = {
             "name": "name", "personal details": "name", "personal information": "name",
-            "contact info": "name", "profile": "name",
+            "contact info": "name",
             "about me": "summary", "about": "summary", "summary": "summary",
             "career summary": "summary", "professional summary": "summary",
             "objective": "summary", "career objective": "summary", "introduction": "summary",
+            "profile": "summary",
             "skills": "skills", "technical skills": "skills", "key skills": "skills",
             "core skills": "skills", "skill set": "skills", "skills summary": "skills",
             "technical expertise": "skills", "technologies": "skills",
@@ -187,13 +188,15 @@
             "work history": "experience", "employment": "experience",
             "internship": "experience", "internships": "experience",
             "projects": "projects", "project": "projects", "academic projects": "projects",
-            "personal projects": "projects", "project experience": "projects",
+            "personal projects": "projects", "project experience": "projects", "project details": "projects",
             "certifications": "certifications", "certificates": "certifications",
             "certification": "certifications", "credentials": "certifications",
             "licenses": "certifications", "awards": "awards", "achievements": "awards",
             "honors": "awards", "recognition": "awards",
             "languages": "languages", "language skills": "languages",
-            "interests": "interests", "hobbies": "interests",
+            "languages known": "languages",
+            "interests": "interests", "hobbies": "interests", "interests & hobbies": "interests",
+            "educational background": "education", "trainings attended": "training",
             "references": "references", "referees": "references"
         };
 
@@ -218,10 +221,6 @@
         const mainContent = document.getElementById('mainContent');
         const navStatus = document.getElementById('navStatus');
         const fileNameDisplay = document.getElementById('fileName');
-
-    
-        let fullTextPdfExtracted = false;
-
         resumeFile.addEventListener('change', handleFileSelect);
 
         function handleFileSelect(e) {
@@ -233,6 +232,9 @@
             
             window.latestResumeId = null;
             fullTextPdfExtracted = false;
+            window.sectionState = {};
+            window.allSectionsData = null;
+            window.tableSectionsData = [];
             
            
             resetToSingleColumn();
@@ -282,6 +284,7 @@
 
 
                 window.allSectionsData = data;
+                hydrateSectionStateFromAllSections();
 
                 hideLoading();
                 updateNavStatus('ready', 'Ready');
@@ -334,7 +337,6 @@
         function populateDefaultSections() {
             sectionSelect.innerHTML = '<option value="">Select section</option>';
             defaultSections.forEach(section => addSectionOption(section.value, section.label));
-            addSectionOption("all_sections", "All Sections (Table View)");
         }
 
         function showDetectedSections(count, useDefault = false) {
@@ -354,28 +356,146 @@
         }
 
         window.allSectionsData = null;
+        window.sectionState = {};
+
+        function normalizeSectionKey(name) {
+            return String(name || '').trim().toLowerCase().replace(/\s+/g, '-');
+        }
+
+        function toConfidenceFraction(value) {
+            const n = Number(value);
+            if (!Number.isFinite(n)) return 0;
+            return n > 1 ? n / 100 : n;
+        }
+
+        function toConfidencePercent(value) {
+            const n = Number(value);
+            if (!Number.isFinite(n)) return 0;
+            return n <= 1 ? Math.round(n * 1000) / 10 : Math.round(n * 10) / 10;
+        }
+
+        function getCanonicalSectionKey(input) {
+            const mapped = mapHeadingToSection(String(input || ''));
+            return normalizeSectionKey(mapped);
+        }
+
+        function setSectionState(sectionKey, content, confidence) {
+            const key = getCanonicalSectionKey(sectionKey);
+            window.sectionState[key] = {
+                content: content || '',
+                confidence: toConfidenceFraction(confidence),
+                updatedAt: Date.now()
+            };
+            return key;
+        }
+
+        function getSectionState(sectionKey) {
+            const key = getCanonicalSectionKey(sectionKey);
+            return window.sectionState[key] || null;
+        }
+
+        function syncSectionInAllSectionsData(sectionKey, content, confidence) {
+            if (!window.allSectionsData) {
+                window.allSectionsData = {};
+            }
+            if (!Array.isArray(window.allSectionsData.all_sections)) {
+                window.allSectionsData.all_sections = [];
+            }
+
+            const key = getCanonicalSectionKey(sectionKey);
+            const confidencePercent = toConfidencePercent(confidence);
+            const target = window.allSectionsData.all_sections.find(item =>
+                getCanonicalSectionKey(item.section) === key
+            );
+
+            if (target) {
+                target.content = content || '';
+                if (confidencePercent > 0) target.confidence = confidencePercent;
+                return;
+            }
+
+            const label = String(sectionKey || '').replace(/-/g, ' ').replace(/\b\w/g, m => m.toUpperCase());
+            window.allSectionsData.all_sections.push({
+                section: label,
+                content: content || '',
+                confidence: confidencePercent
+            });
+        }
+
+        function hydrateSectionStateFromAllSections() {
+            if (!window.allSectionsData || !Array.isArray(window.allSectionsData.all_sections)) return;
+            window.allSectionsData.all_sections.forEach(item => {
+                const key = getCanonicalSectionKey(item.section);
+                setSectionState(key, item.content || '', item.confidence || 0);
+            });
+            if (window.allSectionsData.full_text) {
+                setSectionState('fulltext', window.allSectionsData.full_text, 1);
+            }
+        }
+
+        function getCanonicalSectionsList() {
+            const source = Array.isArray(window.allSectionsData?.all_sections)
+                ? window.allSectionsData.all_sections
+                : [];
+            return source.map(item => {
+                const state = getSectionState(item.section);
+                if (!state) return item;
+                return {
+                    ...item,
+                    content: state.content || '',
+                    confidence: toConfidencePercent(state.confidence)
+                };
+            });
+        }
+
+        function applyCorrectionToCanonicalState(fieldName, correctedValue, confidence) {
+            const key = setSectionState(fieldName, correctedValue, confidence || getSectionState(fieldName)?.confidence || 1);
+            syncSectionInAllSectionsData(key, correctedValue, confidence || getSectionState(key)?.confidence || 1);
+            if (key === 'fulltext') {
+                window.allSectionsData = window.allSectionsData || {};
+                window.allSectionsData.full_text = correctedValue || '';
+            }
+
+            if (Array.isArray(window.tableSectionsData)) {
+                window.tableSectionsData.forEach(item => {
+                    if (getCanonicalSectionKey(item.section) === key) {
+                        item.original = correctedValue;
+                        if (confidence !== undefined && confidence !== null) {
+                            item.confidence = toConfidencePercent(confidence);
+                        }
+                    }
+                });
+            }
+        }
 
         sectionSelect.addEventListener('change', async function () {
             const selectedSection = sectionSelect.value;
             const file = resumeFile.files[0];
             if (!file || !selectedSection) return;
 
+            const cachedState = getSectionState(selectedSection);
+            if (cachedState && selectedSection !== "fulltext_layout") {
+                if (selectedSection === 'fulltext') {
+                    const sections = getCanonicalSectionsList();
+                    showFullTextWithSections(cachedState.content || '', sections);
+                } else {
+                    showResults(cachedState.content || 'No data found', cachedState.confidence || 0, false);
+                }
+                updateNavStatus('ready', 'Ready');
+                return;
+            }
+
             showLoading('Extracting...');
             updateNavStatus('processing', 'Extracting...');
 
             if (selectedSection === "fulltext_layout") {
                 await extractLayoutWithSections(file);
-            } else if (selectedSection === "all_sections") {
-                await showAllSectionsTable();
             } else {
                 await extractSection(file, selectedSection);
             }
         });
 
         async function showAllSectionsTable() {
-            document.getElementById('fullTextViewBox').style.display = 'none';
-            document.getElementById('tableViewBox').style.display = 'none';
-
             hideLoading();
             updateNavStatus('ready', 'Ready');
 
@@ -384,13 +504,52 @@
                 return;
             }
 
-            const sections = window.allSectionsData.all_sections;
-            
-            
-            showSectionsTable(sections);
+            const sections = getCanonicalSectionsList();
+            const fullText = window.allSectionsData.full_text || '';
+            let tableHTML = `
+                <div class="sections-table-container">
+                    <div class="sections-summary">
+                        <span class="badge bg-primary">${sections.length} Sections Detected</span>
+                    </div>
+                    <table class="sections-table">
+                        <thead>
+                            <tr>
+                                <th>Section</th>
+                                <th>Content</th>
+                                <th>Confidence</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+            `;
+
+            sections.forEach(item => {
+                const confidenceClass = item.confidence >= 70 ? 'high' : item.confidence >= 40 ? 'medium' : 'low';
+                const contentPreview = item.content.length > 200 ? item.content.substring(0, 200) + '...' : item.content;
+                tableHTML += `
+                    <tr>
+                        <td class="section-name">${item.section}</td>
+                        <td class="section-content">${escapeHtml(contentPreview)}</td>
+                        <td class="confidence-cell">
+                            <span class="confidence-badge ${confidenceClass}">${item.confidence}%</span>
+                        </td>
+                    </tr>
+                `;
+            });
+
+            tableHTML += `
+                        </tbody>
+                    </table>
+                    ${fullText ? `
+                    <div class="full-text-section">
+                        <h4><i class="fas fa-file-alt"></i> Full Resume Text</h4>
+                        <pre class="full-text-content">${escapeHtml(fullText)}</pre>
+                    </div>
+                    ` : ''}
+                </div>
+            `;
 
             const resultsContent = document.getElementById('resultsContent');
-            resultsContent.innerHTML = '<p class="text-muted"><i class="fas fa-table"></i> Select "Full Text (PDF)" to view table in right panel</p>';
+            resultsContent.innerHTML = tableHTML;
             resultsContent.style.background = 'white';
 
             document.getElementById('confidencePill').className = 'confidence-pill high';
@@ -398,8 +557,6 @@
 
             resultBox.style.display = 'block';
             document.getElementById('correctionBox').style.display = 'none';
-            
-      
             resetToSingleColumn();
         }
 
@@ -442,16 +599,24 @@
                 hideLoading();
                 updateNavStatus('ready', 'Ready');
 
-                if (data.status === "success" && data.html_output) {
-                    
-                    fullTextPdfExtracted = true;
-             
-                    showLayoutWithSections(data.html_output, window.allSectionsData?.all_sections || []);
-                
-                    showSectionsTable(window.allSectionsData?.all_sections || []);
-                    
-                   
-                    enableTwoColumnLayout();
+                if (data.status === "success") {
+                    const sections = getCanonicalSectionsList();
+                    const plainText = data.plain_text || window.allSectionsData?.full_text || '';
+                    const unifiedLayoutHtml = buildUnifiedLayoutFromSections(sections, plainText);
+
+                    if (unifiedLayoutHtml && unifiedLayoutHtml.trim().length > 0) {
+                        fullTextPdfExtracted = true;
+                        showLayoutWithSections(unifiedLayoutHtml, sections);
+                        showSectionsTable(sections);
+                        enableTwoColumnLayout();
+                    } else if (data.html_output && data.html_output.trim().length > 0) {
+                        fullTextPdfExtracted = true;
+                        showLayoutWithSections(data.html_output, sections);
+                        showSectionsTable(sections);
+                        enableTwoColumnLayout();
+                    } else {
+                        showError('Could not extract layout');
+                    }
                 } else {
                     showError('Could not extract layout');
                 }
@@ -460,6 +625,64 @@
                 updateNavStatus('error', 'Error');
                 showError('Error extracting layout');
             }
+        }
+
+        function buildFallbackLayoutHtml(plainText) {
+            const safe = escapeHtml(plainText || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+            const lines = safe.split('\n');
+            const blocks = lines.map(line => {
+                const trimmed = line.trim();
+                if (!trimmed) return '<div class="section-content">&nbsp;</div>';
+                if (trimmed.length <= 45 && /^[A-Za-z0-9&()\-\/\s:]+$/.test(trimmed)) {
+                    return `<div class="section-title">${trimmed}</div>`;
+                }
+                return `<div class="section-content">${trimmed}</div>`;
+            });
+            return `<div class="page"><div class="resume-content">${blocks.join('')}</div></div>`;
+        }
+
+        function buildUnifiedLayoutFromSections(sections, plainText) {
+            const sectionOrder = [
+                'Name', 'Summary', 'Skills', 'Education', 'Experience', 'Projects',
+                'Certifications', 'Awards', 'Achievements', 'Training', 'Languages',
+                'Interests', 'Volunteer', 'Publications', 'References', 'Declaration',
+                'Strengths', 'Contact', 'Email', 'Phone', 'Links'
+            ];
+
+            const byName = new Map();
+            (sections || []).forEach(item => {
+                if (!item || !item.section || !item.content) return;
+                const key = String(item.section).trim();
+                if (!key || byName.has(key)) return;
+                byName.set(key, item.content);
+            });
+
+            const ordered = [];
+            sectionOrder.forEach(name => {
+                if (byName.has(name)) {
+                    ordered.push({ section: name, content: byName.get(name) });
+                    byName.delete(name);
+                }
+            });
+
+            for (const [section, content] of byName.entries()) {
+                ordered.push({ section, content });
+            }
+
+            if (ordered.length === 0) {
+                return buildFallbackLayoutHtml(plainText || '');
+            }
+
+            const blocks = ordered.map(item => {
+                const title = escapeHtml(item.section);
+                const content = escapeHtml(item.content || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+                return `
+                    <div class="section-title">${title}</div>
+                    <div class="section-content">${content.replace(/\n/g, '<br>')}</div>
+                `;
+            });
+
+            return `<div class="page"><div class="resume-content">${blocks.join('')}</div></div>`;
         }
 
         function enableTwoColumnLayout() {
@@ -474,6 +697,7 @@
 
         function showLayoutWithSections(layoutHtml, sections) {
             const resultsContent = document.getElementById('resultsContent');
+            const normalizedLayout = normalizeLayoutHtml(layoutHtml);
 
             let html = `
                 <div class="extraction-split-view-right">
@@ -481,7 +705,7 @@
                         <div class="panel-header">
                             <h4><i class="fas fa-file-pdf"></i> Full Resume (PDF Format)</h4>
                         </div>
-                        <div class="panel-content layout-content">${layoutHtml}</div>
+                        <div class="panel-content layout-content">${normalizedLayout}</div>
                     </div>
                 </div>
             `;
@@ -494,6 +718,17 @@
 
             resultBox.style.display = 'block';
             document.getElementById('correctionBox').style.display = 'none';
+        }
+
+        function normalizeLayoutHtml(layoutHtml) {
+            if (!layoutHtml || typeof layoutHtml !== 'string') return '';
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(layoutHtml, 'text/html');
+
+            doc.querySelectorAll('style, script, link, meta, title').forEach(node => node.remove());
+
+            const body = doc.body ? doc.body.innerHTML : layoutHtml;
+            return body || '';
         }
 
 
@@ -513,11 +748,19 @@
                
                 resetToSingleColumn();
 
+                let resultContent = Array.isArray(data.result) ? data.result.join('\n') : (data.result || 'No data found');
+                const resultConfidence = data.confidence || 0;
+                setSectionState(section, resultContent, resultConfidence);
+                syncSectionInAllSectionsData(section, resultContent, resultConfidence);
+                if (section === 'fulltext') {
+                    window.allSectionsData = window.allSectionsData || {};
+                    window.allSectionsData.full_text = resultContent;
+                }
+
                 if (section === 'fulltext' && window.allSectionsData) {
-                    showFullTextWithSections(data.result, window.allSectionsData.all_sections);
+                    showFullTextWithSections(resultContent, getCanonicalSectionsList());
                 } else {
-                    let resultContent = Array.isArray(data.result) ? data.result.join('\n') : (data.result || 'No data found');
-                    showResults(resultContent, data.confidence || 0, false);
+                    showResults(resultContent, resultConfidence, false);
                 }
             } catch (error) {
                 hideLoading();
@@ -584,7 +827,7 @@
             }
 
             const headingPatterns = [];
-            const sections = window.allSectionsData?.all_sections || [];
+            const sections = getCanonicalSectionsList();
             sections.forEach(section => {
                 const sectionName = section.section.toLowerCase();
                 headingPatterns.push({
@@ -620,10 +863,21 @@
             const tableViewBox = document.getElementById('tableViewBox');
             const tableViewContent = document.getElementById('tableViewContent');
 
-            if (!sections || sections.length === 0) {
+            const canonicalSections = Array.isArray(sections) ? sections : [];
+            if (!canonicalSections || canonicalSections.length === 0) {
                 tableViewBox.style.display = 'none';
                 return;
             }
+
+            canonicalSections.forEach(item => {
+                setSectionState(item.section, item.content || '', item.confidence || 0);
+            });
+
+            window.tableSectionsData = canonicalSections.map(item => ({
+                section: item.section,
+                original: item.content || '',
+                confidence: item.confidence
+            }));
 
             let tableHTML = `
                 <div class="sections-summary-right">
@@ -640,14 +894,14 @@
                     <tbody>
             `;
 
-            sections.forEach((item, index) => {
+            canonicalSections.forEach((item, index) => {
                 const confidenceClass = item.confidence >= 70 ? 'high' : item.confidence >= 40 ? 'medium' : 'low';
                 const contentId = `content-${index}`;
                 const correctionId = `correction-${index}`;
                 const originalContent = escapeHtml(item.content);
                 
                 tableHTML += `
-                    <tr data-section="${item.section}" data-original="${originalContent}" data-index="${index}">
+                    <tr data-section="${item.section}" data-index="${index}">
                         <td class="section-name">${item.section}</td>
                         <td class="section-content" id="${contentId}">${originalContent}</td>
                         <td class="correction-cell">
@@ -676,12 +930,14 @@
 
         function submitAllCorrections() {
             const rows = document.querySelectorAll('#editableSectionsTable tbody tr');
-            let correctionsSubmitted = 0;
+            const corrections = [];
             let emptyCount = 0;
             
             rows.forEach((row, index) => {
                 const sectionName = row.dataset.section;
-                const originalContent = row.dataset.original;
+                const originalContent = (window.tableSectionsData && window.tableSectionsData[index])
+                    ? window.tableSectionsData[index].original
+                    : '';
                 const correctionInput = row.querySelector('.correction-input');
                 const correctedContent = correctionInput.value.trim();
                 
@@ -693,24 +949,104 @@
                 if (originalContent.trim() === correctedContent.trim()) {
                     return;
                 }
-                
-                
-                const resumeId = window.latestResumeId || 0;
-                submitTableCorrection(resumeId, sectionName, originalContent, correctedContent, index);
-                correctionsSubmitted++;
+
+                corrections.push({
+                    rowIndex: index,
+                    field_name: sectionName,
+                    original_value: originalContent,
+                    corrected_value: correctedContent,
+                    feedback_type: 'correction',
+                    confidence_before: 0.5,
+                    comment: 'Table inline correction'
+                });
             });
             
-            if (correctionsSubmitted === 0 && emptyCount > 0) {
+            if (corrections.length === 0 && emptyCount > 0) {
                 showNotification('Please enter at least one correction value', 'error');
-            } else if (correctionsSubmitted === 0) {
+            } else if (corrections.length === 0) {
                 showNotification('No changes to submit', 'info');
+            } else {
+                const resumeId = window.latestResumeId || 0;
+                submitBatchTableCorrections(resumeId, corrections);
+            }
+        }
+
+        async function submitBatchTableCorrections(resumeId, corrections) {
+            try {
+                const payload = {
+                    resume_id: resumeId,
+                    source: 'table_edit_batch',
+                    session_id: 'session_' + Date.now(),
+                    auto_deploy: true,
+                    corrections: corrections.map(item => ({
+                        field_name: item.field_name,
+                        original_value: item.original_value,
+                        corrected_value: item.corrected_value,
+                        feedback_type: item.feedback_type,
+                        confidence_before: item.confidence_before,
+                        comment: item.comment
+                    }))
+                };
+
+                const response = await fetch('/api/feedback/batch', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const data = await response.json();
+                if (!response.ok || data.status !== 'success') {
+                    const message = data?.message || 'Batch correction failed';
+                    showNotification('Error: ' + message, 'error');
+                    return;
+                }
+
+                const byIndex = new Map();
+                (data.items || []).forEach(item => {
+                    if (typeof item.index === 'number') {
+                        byIndex.set(item.index, item);
+                    }
+                });
+
+                let savedCount = 0;
+                corrections.forEach((entry, localIdx) => {
+                    const row = document.querySelector(`tr[data-index="${entry.rowIndex}"]`);
+                    if (!row) return;
+
+                    const backendItem = byIndex.get(localIdx);
+                    if (!backendItem || backendItem.status !== 'saved') {
+                        return;
+                    }
+
+                    savedCount++;
+                    row.classList.add('corrected');
+                    row.dataset.originalStored = entry.corrected_value;
+                    if (window.tableSectionsData && window.tableSectionsData[entry.rowIndex]) {
+                        window.tableSectionsData[entry.rowIndex].original = entry.corrected_value;
+                    }
+                    applyCorrectionToCanonicalState(entry.field_name, entry.corrected_value, 1);
+                    const contentCell = row.querySelector('.section-content');
+                    if (contentCell) contentCell.classList.remove('modified');
+                    const correctionInput = row.querySelector('.correction-input');
+                    if (correctionInput) correctionInput.value = '';
+                });
+
+                if (savedCount > 0) {
+                    showNotification(`Corrections submitted successfully (${savedCount})`, 'success');
+                } else {
+                    showNotification('No corrections were saved. Check values and try again.', 'error');
+                }
+            } catch (err) {
+                showNotification('Failed to submit corrections', 'error');
             }
         }
 
         function submitTableCorrectionByIndex(index) {
             const row = document.querySelector(`tr[data-index="${index}"]`);
             const sectionName = row.dataset.section;
-            const originalContent = row.dataset.original;
+            const originalContent = (window.tableSectionsData && window.tableSectionsData[index])
+                ? window.tableSectionsData[index].original
+                : '';
             const correctionInput = row.querySelector('.correction-input');
             const correctedContent = correctionInput.value.trim();
             
@@ -757,7 +1093,10 @@
             const saveBtn = row.querySelector('.save-btn');
             const cancelBtn = row.querySelector('.cancel-btn');
             
-            contentCell.innerText = row.dataset.originalStored || row.dataset.original;
+            const fallbackOriginal = (window.tableSectionsData && window.tableSectionsData[index])
+                ? window.tableSectionsData[index].original
+                : '';
+            contentCell.innerText = row.dataset.originalStored || fallbackOriginal;
             contentCell.contentEditable = false;
             contentCell.classList.remove('editing');
             contentCell.classList.remove('modified');
@@ -788,7 +1127,9 @@
         function correctRow(index) {
             const row = document.querySelector(`tr[data-index="${index}"]`);
             const sectionName = row.dataset.section;
-            const originalContent = row.dataset.original;
+            const originalContent = (window.tableSectionsData && window.tableSectionsData[index])
+                ? window.tableSectionsData[index].original
+                : '';
             const correctedContent = row.querySelector('.section-content').innerText;
             
             const resumeId = window.latestResumeId || 0;
@@ -825,8 +1166,11 @@
                    
                     const row = document.querySelector(`tr[data-index="${rowIndex}"]`);
                     row.classList.add('corrected');
-                    row.dataset.original = correctedValue;
                     row.dataset.originalStored = correctedValue;
+                    if (window.tableSectionsData && window.tableSectionsData[rowIndex]) {
+                        window.tableSectionsData[rowIndex].original = correctedValue;
+                    }
+                    applyCorrectionToCanonicalState(fieldName, correctedValue, 1);
                     row.querySelector('.section-content').classList.remove('modified');
                     
                     showNotification('Correction submitted successfully!', 'success');
@@ -918,6 +1262,16 @@
                 if (feedbackData.status === 'success') {
                     alert('Correction submitted! Thank you for helping us improve.');
                     document.getElementById('correctedValue').value = '';
+                    if (window.currentExtraction) {
+                        window.currentExtraction.content = corrected;
+                    }
+                    applyCorrectionToCanonicalState(data?.section || 'unknown', corrected, data?.confidence || 1);
+                    document.getElementById('originalValue').textContent =
+                        corrected.substring(0, 80) + (corrected.length > 80 ? '...' : '');
+                    const resultsContent = document.getElementById('resultsContent');
+                    if (resultsContent) {
+                        resultsContent.textContent = corrected;
+                    }
                 } else {
                     alert('Error: ' + feedbackData.message);
                 }
@@ -929,4 +1283,5 @@
 </body>
 
 </html>
+
 

@@ -12,12 +12,19 @@ from flask import Flask, render_template, request, jsonify, redirect, url_for
 
 app = Flask(__name__)
 
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 from src.models.models import db, init_database, save_resume, get_resume, get_all_resumes, delete_resume, update_resume, search_resumes
 from src.utils.text import extract_text_from_pdf
 from src.utils.section_extractor import extract_section_from_resume
 from src.models.name import extract_name_from_resume
 from src.utils.formatter import clean_fulltext_format
 from src.utils.headings import detect_headings
+from normalizers.builder_schema_mapper import get_builder_schema_mapper, infer_file_type
 
 try:
     from src.extractors.layoutlm_extractor import extract_with_layoutlm, is_layoutlm_available, LAYOUTLM_AVAILABLE
@@ -94,12 +101,7 @@ except ImportError:
     extract_layout_json = None
     extract_layout_html = None
 
-try:
-    from src.utils.continuous_learning import get_continuous_learning
-    CONTINUOUS_LEARNING_AVAILABLE = True
-except ImportError:
-    CONTINUOUS_LEARNING_AVAILABLE = False
-    get_continuous_learning = None
+CONTINUOUS_LEARNING_AVAILABLE = True
 
 try:
     from src.extractors.handwriting_extractor import is_handwriting_available
@@ -132,13 +134,7 @@ except ImportError as e:
     FEATURE_API_ROUTES_AVAILABLE = False
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-
+BUILDER_NORMALIZATION_AVAILABLE = True
 
 
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///resumes.db'
@@ -198,6 +194,58 @@ def calculate_overall_accuracy() -> float:
         return 0.0
     overall = sum(valid_scores) / len(valid_scores) * 100
     return round(overall, 2)
+
+
+def _safe_int(value: Any, default: int = 1) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_native_structured_payload(
+    text: str,
+    text_confidence: float,
+    all_sections: Dict[str, Tuple[str, float]],
+) -> Dict[str, Any]:
+    sections_copy = dict(all_sections)
+    sections_copy["text"] = (text, text_confidence)
+
+    if STRUCTURED_OUTPUT_AVAILABLE:
+        return generate_structured_resume(text, sections_copy)
+
+    fallback: Dict[str, Any] = {}
+    for section_name, (data, confidence) in all_sections.items():
+        fallback[section_name] = {
+            "raw_text": data or "",
+            "structured_data": {},
+            "confidence": confidence,
+            "method": "section_extractor",
+            "error": None,
+        }
+    fallback["raw_text"] = {
+        "raw_text": text,
+        "structured_data": {"word_count": len((text or "").split())},
+        "confidence": text_confidence,
+        "method": "pdfminer",
+        "error": None,
+    }
+    return fallback
+
+
+def _build_builder_response(
+    native_structured: Dict[str, Any],
+    overall_accuracy: float,
+    local_resume_id: int,
+    filename: str,
+) -> Dict[str, Any]:
+    mapper = get_builder_schema_mapper()
+    return mapper.map_parser_output(
+        raw_parser_output=native_structured,
+        overall_confidence=overall_accuracy,
+        local_resume_id=local_resume_id,
+        file_type=infer_file_type(filename),
+    )
 
 
 
@@ -295,105 +343,142 @@ def extract_name_from_bold_text(pdf_path: str) -> Tuple[str, float]:
         return "", 0.0
 
 
-def get_feedback_corrections(field_name: str) -> Dict[str, str]:
-  
-    corrections = {}
+def _preview_for_log(value: Any, limit: int = 120) -> str:
+    text = str(value or "").replace("\n", " ").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
+
+
+def _normalize_for_correction(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).replace("\r\n", "\n").replace("\r", "\n").strip().lower().split())
+
+
+def _calibrate_confidence(field_name: str, confidence: float, trace_context: str) -> float:
     try:
-        
-        from src.utils.correction_storage import get_correction_storage
-        
-        storage = get_correction_storage()
-        corrections = storage.get_corrections_dict(field_name)
-        
-        if corrections:
-            logger.info(f"Found {len(corrections)} permanent corrections for field '{field_name}'")
-        
-        
-        from src.utils.continuous_learning import get_continuous_learning
-        
-        learning = get_continuous_learning()
-        pending = learning.get_pending_corrections()
-        
-        for correction in pending:
-            if correction.get('field_name') == field_name:
-                original = correction.get('original_value', '')
-                corrected = correction.get('corrected_value', '')
-                if original and corrected and original.lower() not in corrections:
-                    corrections[original.lower()] = corrected
-                    
-    except Exception as e:
-        logger.warning(f"Error getting feedback corrections: {e}")
-    
-    return corrections
+        from src.training.correction_learning import get_confidence_calibrator
+        calibrated = get_confidence_calibrator().calibrate(field_name, confidence)
+        if calibrated != confidence:
+            logger.info(
+                "Confidence calibrated [%s] field=%s raw=%s calibrated=%s",
+                trace_context,
+                field_name,
+                round(confidence, 4),
+                round(calibrated, 4),
+            )
+        return calibrated
+    except Exception as calibration_error:
+        logger.debug("Confidence calibration skipped for field=%s: %s", field_name, calibration_error)
+        return confidence
 
 
-def apply_corrections_to_field(field_name: str, extracted_value: str, original_confidence: float = 0.0) -> Tuple[str, float]:
+def apply_corrections_to_field(
+    field_name: str,
+    extracted_value: str,
+    original_confidence: float = 0.0,
+    *,
+    force_ml: bool = False,
+    trace_context: str = "default",
+) -> Tuple[str, float]:
     if not extracted_value:
         return extracted_value, original_confidence
     
     current_value = extracted_value
     current_confidence = original_confidence
-    corrections_applied = []
-    
     
     try:
-        legacy_corrections = get_feedback_corrections(field_name)
-        if legacy_corrections:
-            value_lower = current_value.lower()
-            for original, corrected in legacy_corrections.items():
-                if original.lower() in value_lower:
-                    current_value = current_value.replace(original.lower(), corrected)
-                    corrections_applied.append(f"legacy: {original[:20]}...")
-                    logger.info(f"Applied legacy correction to {field_name}: {original[:20]}... -> {corrected[:20]}...")
+        from src.utils.correction_storage import get_correction_storage
+        storage = get_correction_storage()
+        normalized_field = _normalize_for_correction(field_name) or "unknown"
+        normalized_lookup = _normalize_for_correction(current_value)
+        logger.info(
+            "Correction trace [%s] field_raw='%s' field_norm='%s' value_norm='%s' value_raw='%s'",
+            trace_context,
+            field_name,
+            normalized_field,
+            normalized_lookup[:180],
+            _preview_for_log(current_value),
+        )
+
+        best_match = storage.find_best_correction(field_name, current_value)
+        if best_match:
+            corrected = best_match.get("corrected_value", current_value)
+            if corrected != current_value:
+                logger.info(
+                    "Feedback correction [%s] field=%s current='%s' matched='%s' final='%s' type=%s",
+                    trace_context,
+                    field_name,
+                    _preview_for_log(current_value),
+                    _preview_for_log(best_match.get("matched_original")),
+                    _preview_for_log(corrected),
+                    best_match.get("match_type"),
+                )
+                current_value = corrected
+                current_confidence = max(current_confidence, 0.98)
+                logger.info(
+                    "Correction trace applied [%s] field_norm='%s' final_norm='%s' confidence=%s",
+                    trace_context,
+                    normalized_field,
+                    _normalize_for_correction(current_value)[:180],
+                    round(current_confidence, 4),
+                )
+        else:
+            logger.info(
+                "No feedback correction match [%s] field=%s field_norm='%s' key='%s' current='%s'",
+                trace_context,
+                field_name,
+                normalized_field,
+                normalized_lookup[:180],
+                _preview_for_log(current_value),
+            )
     except Exception as e:
-        logger.debug(f"Legacy corrections error for {field_name}: {e}")
-    
-    
-    try:
-        from src.utils.pattern_corrections import apply_pattern_corrections
-        corrected, info = apply_pattern_corrections(field_name, current_value)
-        if info.get("applied"):
-            current_value = corrected
-            corrections_applied.extend(info.get("corrections", []))
-            logger.info(f"Applied pattern corrections to {field_name}: {info.get('corrections', [])}")
-    except Exception as e:
-        logger.debug(f"Pattern corrections error for {field_name}: {e}")
-    
-    
-    try:
-        from src.training.correction_learning import get_correction_model_engine
-        engine = get_correction_model_engine()
-        result = engine.apply(field_name=field_name, value=current_value, confidence=current_confidence)
-        if result.get("applied"):
-            current_value = result.get("corrected_value", current_value)
-            current_confidence = result.get("confidence", current_confidence)
-            corrections_applied.append(f"ml: {result.get('reason')}")
-            logger.info(f"Applied ML correction to {field_name}: {result.get('reason')}")
-    except Exception as e:
-        logger.debug(f"ML corrections error for {field_name}: {e}")
-    
-    if corrections_applied:
-        logger.info(f"Total corrections applied to '{field_name}': {corrections_applied}")
-    
+        logger.debug(f"Feedback correction error for {field_name}: {e}")
+
+    current_confidence = _calibrate_confidence(field_name, current_confidence, trace_context)
     return current_value, current_confidence
 
 
+def apply_feedback_corrections_to_results(
+    results: Dict[str, Tuple[str, float]]
+) -> Dict[str, Tuple[str, float]]:
+    corrected_results: Dict[str, Tuple[str, float]] = {}
+    logger.info("Final-pass correction pipeline starting for %s fields", len(results))
+
+    for field_name, data in results.items():
+        value = ""
+        confidence = 0.0
+        if isinstance(data, tuple) and len(data) >= 2:
+            value, confidence = data[0], data[1]
+        else:
+            value = data if isinstance(data, str) else ""
+
+        corrected_value, corrected_confidence = apply_corrections_to_field(
+            field_name,
+            value,
+            confidence,
+            force_ml=True,
+            trace_context="final_pipeline",
+        )
+        corrected_results[field_name] = (corrected_value, corrected_confidence)
+        logger.info(
+            "Final-pass correction result field=%s raw_before='%s' raw_after='%s' norm_before='%s' norm_after='%s' conf_before=%s conf_after=%s",
+            field_name,
+            _preview_for_log(value),
+            _preview_for_log(corrected_value),
+            _normalize_for_correction(value)[:180],
+            _normalize_for_correction(corrected_value)[:180],
+            round(confidence, 4),
+            round(corrected_confidence, 4),
+        )
+
+    return corrected_results
+
+
 def extract_name_with_filename_fallback(text: str, filename: str, pdf_path: Optional[str] = None) -> Tuple[str, float]:
-    
-    
-    corrections = get_feedback_corrections("name")
-    
-    if corrections:
-        logger.info(f"Found {len(corrections)} feedback corrections for name field")
-        
-        text_lower = text.lower()
-        for original, corrected in corrections.items():
-            if original.lower() in text_lower:
-                logger.info(f"Using feedback correction: '{original}' -> '{corrected}'")
-                return corrected, 0.95  
-    
     try:
-        extracted_name, confidence = extract_name_from_resume(text)
+        extracted_name, confidence = extract_name_from_resume(text, pdf_path)
         
         
         if extracted_name and confidence > 0:
@@ -449,8 +534,6 @@ def extract_all_sections(text: str, pdf_path: Optional[str] = None, filename: st
         try:
             
             name, conf = extract_name_with_filename_fallback(text, filename, pdf_path)
-            
-            name, conf = apply_corrections_to_field("name", name, conf)
             results["name"] = (name, conf)
             confidence_scores["name_confidence"] = conf
         except Exception as e:
@@ -461,8 +544,6 @@ def extract_all_sections(text: str, pdf_path: Optional[str] = None, filename: st
     
     try:
         skills, conf = extract_section_from_resume(text, "skills", pdf_path)
-        
-        skills, conf = apply_corrections_to_field("skills", skills, conf)
         results["skills"] = (skills, conf)
         confidence_scores["skills_confidence"] = conf
     except Exception as e:
@@ -471,8 +552,6 @@ def extract_all_sections(text: str, pdf_path: Optional[str] = None, filename: st
     
     try:
         education, conf = extract_section_from_resume(text, "education", pdf_path)
-        
-        education, conf = apply_corrections_to_field("education", education, conf)
         results["education"] = (education, conf)
         confidence_scores["education_confidence"] = conf
     except Exception as e:
@@ -481,8 +560,6 @@ def extract_all_sections(text: str, pdf_path: Optional[str] = None, filename: st
     
     try:
         experience, conf = extract_section_from_resume(text, "experience", pdf_path)
-        
-        experience, conf = apply_corrections_to_field("experience", experience, conf)
         results["experience"] = (experience, conf)
         confidence_scores["experience_confidence"] = conf
     except Exception as e:
@@ -491,8 +568,6 @@ def extract_all_sections(text: str, pdf_path: Optional[str] = None, filename: st
     
     try:
         projects, conf = extract_section_from_resume(text, "projects", pdf_path)
-        
-        projects, conf = apply_corrections_to_field("projects", projects, conf)
         results["projects"] = (projects, conf)
         confidence_scores["projects_confidence"] = conf
     except Exception as e:
@@ -501,8 +576,6 @@ def extract_all_sections(text: str, pdf_path: Optional[str] = None, filename: st
     
     try:
         certifications, conf = extract_section_from_resume(text, "certifications", pdf_path)
-        
-        certifications, conf = apply_corrections_to_field("certifications", certifications, conf)
         results["certifications"] = (certifications, conf)
         confidence_scores["certifications_confidence"] = conf
     except Exception as e:
@@ -512,8 +585,6 @@ def extract_all_sections(text: str, pdf_path: Optional[str] = None, filename: st
     
     try:
         awards, conf = extract_section_from_resume(text, "awards", pdf_path)
-        
-        awards, conf = apply_corrections_to_field("awards", awards, conf)
         results["awards"] = (awards, conf)
         confidence_scores["awards_confidence"] = conf
     except Exception as e:
@@ -523,8 +594,6 @@ def extract_all_sections(text: str, pdf_path: Optional[str] = None, filename: st
     
     try:
         references, conf = extract_section_from_resume(text, "references", pdf_path)
-        
-        references, conf = apply_corrections_to_field("references", references, conf)
         results["references"] = (references, conf)
         confidence_scores["references_confidence"] = conf
     except Exception as e:
@@ -545,8 +614,6 @@ def extract_all_sections(text: str, pdf_path: Optional[str] = None, filename: st
         for section_name, extractor_func in new_sections:
             try:
                 result, conf = extractor_func(text)
-                
-                result, conf = apply_corrections_to_field(section_name, result, conf)
                 results[section_name] = (result, conf)
                 confidence_scores[f"{section_name}_confidence"] = conf
             except Exception as e:
@@ -562,15 +629,57 @@ def extract_all_sections(text: str, pdf_path: Optional[str] = None, filename: st
     for section_name in additional_sections:
         try:
             result, conf = extract_section_from_resume(text, section_name, pdf_path)
-            
-            result, conf = apply_corrections_to_field(section_name, result, conf)
             results[section_name] = (result, conf)
             confidence_scores[f"{section_name}_confidence"] = conf
         except Exception as e:
             logger.error(f"Error extracting {section_name}: {e}")
             results[section_name] = ("", 0.0)
-    
+
+    results = apply_feedback_corrections_to_results(results)
+
+    for section_name, (_, conf) in results.items():
+        confidence_key = f"{section_name}_confidence"
+        if confidence_key in confidence_scores:
+            confidence_scores[confidence_key] = conf
+
     return results
+
+
+NEW_SECTION_NAMES = {"languages", "interests", "achievements", "publications", "volunteer", "summary"}
+
+
+def extract_section_with_corrections(
+    text: str,
+    section: str,
+    file_path: str,
+    filename: str,
+    trace_context: str,
+) -> Tuple[Optional[str], float]:
+    if section == "name":
+        result, conf = extract_name_with_filename_fallback(text, filename, file_path)
+    elif section in NEW_SECTION_NAMES:
+        if not NEW_SECTIONS_AVAILABLE:
+            return None, 0.0
+        extractors = {
+            "languages": extract_languages_from_resume,
+            "interests": extract_interests_from_resume,
+            "achievements": extract_achievements_from_resume,
+            "publications": extract_publications_from_resume,
+            "volunteer": extract_volunteer_from_resume,
+            "summary": extract_summary_from_resume,
+        }
+        result, conf = extractors[section](text)
+    else:
+        result, conf = extract_section_from_resume(text, section, file_path)
+
+    result, conf = apply_corrections_to_field(
+        section,
+        result,
+        conf,
+        force_ml=True,
+        trace_context=trace_context,
+    )
+    return result, conf
 
 
 
@@ -791,32 +900,21 @@ def extract_ajax():
         
         result_data = {"result": "", "confidence": 0.0}
 
-        if section == "name":
-            result, conf = extract_name_with_filename_fallback(text, file.filename if file else "", file_path)
-            result_data = {"result": result, "confidence": conf}
-
-        elif section == "fulltext":
+        if section == "fulltext":
             result = clean_fulltext_format(text)
             result_data = {"result": result, "confidence": text_confidence}
-        
-        elif section in ["languages", "interests", "achievements", "publications", "volunteer", "summary"]:
-            if NEW_SECTIONS_AVAILABLE:
-                extractors = {
-                    "languages": extract_languages_from_resume,
-                    "interests": extract_interests_from_resume,
-                    "achievements": extract_achievements_from_resume,
-                    "publications": extract_publications_from_resume,
-                    "volunteer": extract_volunteer_from_resume,
-                    "summary": extract_summary_from_resume
-                }
-                result, conf = extractors[section](text)
-                result_data = {"result": result, "confidence": conf}
-            else:
-                result_data = {"result": "Section not available", "confidence": 0.0}
-        
         else:
-            result, conf = extract_section_from_resume(text, section, file_path)
-            result_data = {"result": result, "confidence": conf}
+            result, conf = extract_section_with_corrections(
+                text=text,
+                section=section,
+                file_path=file_path,
+                filename=file.filename if file else "",
+                trace_context="extract_ajax",
+            )
+            if result is None:
+                result_data = {"result": "Section not available", "confidence": 0.0}
+            else:
+                result_data = {"result": result, "confidence": conf}
 
         overall_accuracy = calculate_overall_accuracy()
         result_data["overall_accuracy"] = overall_accuracy
@@ -854,6 +952,13 @@ def detect_headings_api():
         text, text_confidence = extract_text_from_pdf(file_path)
         
         if not text or len(text.strip()) < 10:
+            ext = os.path.splitext(file.filename or "")[1].lower()
+            is_image = ext in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+            if is_image and not HANDWRITING_OCR_AVAILABLE:
+                return jsonify({
+                    "status": "error",
+                    "message": "OCR engine is unavailable for image resumes. Install/configure Tesseract OCR and restart the app."
+                }), 400
             return jsonify({
                 "status": "error",
                 "message": "Could not extract text from the resume"
@@ -890,8 +995,9 @@ def detect_headings_api():
             layout_html = ""
             if PDF_LAYOUT_EXTRACTOR_AVAILABLE:
                 try:
-                    layout_result = extract_full_resume_html(file_path)
-                    layout_html = layout_result.html_output
+                    if str(file.filename).lower().endswith(".pdf"):
+                        layout_result = extract_full_resume_html(file_path)
+                        layout_html = layout_result.html_output
                 except Exception as e:
                     logger.warning(f"Could not extract layout HTML: {e}")
             
@@ -933,10 +1039,17 @@ def detect_headings_api():
         }), 500
 
 
-@app.route("/api/parse", methods=["POST", "GET", "DELETE"])
+@app.route("/api/parse", methods=["POST"])
 def api_parse_resume():
     file = request.files.get("resume")
     section = request.form.get("section")
+    response_mode = (request.form.get("response_mode") or request.form.get("output_mode") or "").strip().lower()
+    builder_mode_requested = response_mode in {
+        "builder",
+        "builder_compatible",
+        "normalized",
+        "builder_normalized",
+    }
 
     if not file or not section:
         return jsonify({
@@ -952,21 +1065,15 @@ def api_parse_resume():
         logger.error(f"Error extracting text: {e}")
         return jsonify({
             "status": "error",
-            "message": "Failed to extract PDF text"
+            "message": "Failed to extract text from the uploaded file"
         }), 500
 
     try:
-        if section == "name":
-            
-            result, conf = extract_name_with_filename_fallback(text, file.filename if file else "", file_path)
-            result_data = result
-            section_confidence = conf
-
-        elif section == "fulltext":
+        if section == "fulltext":
             result_data = clean_fulltext_format(text)
             section_confidence = text_confidence
         
-        elif section == "structured":
+        elif section == "structured" and not builder_mode_requested:
             
             if STRUCTURED_OUTPUT_AVAILABLE:
                 all_sections = extract_all_sections(text, file_path)
@@ -982,28 +1089,46 @@ def api_parse_resume():
                     "status": "error",
                     "message": "Structured output not available"
                 }), 500
+        elif section in {"builder", "builder_compatible"} or (section == "structured" and builder_mode_requested):
+            if not BUILDER_NORMALIZATION_AVAILABLE:
+                return jsonify({
+                    "success": False,
+                    "confidence": 0.0,
+                    "resume_data": {},
+                    "raw_parser_output": {},
+                    "parser_metadata": {
+                        "normalization_logs": {
+                            "builder_compatibility_issues": ["builder normalization not available"]
+                        }
+                    }
+                }), 500
 
-        elif section in ["languages", "interests", "achievements", "publications", "volunteer", "summary"]:
-            if NEW_SECTIONS_AVAILABLE:
-                extractors = {
-                    "languages": extract_languages_from_resume,
-                    "interests": extract_interests_from_resume,
-                    "achievements": extract_achievements_from_resume,
-                    "publications": extract_publications_from_resume,
-                    "volunteer": extract_volunteer_from_resume,
-                    "summary": extract_summary_from_resume
-                }
-                result, conf = extractors[section](text)
-                result_data = result
-                section_confidence = conf
-            else:
+            all_sections = extract_all_sections(text, file_path)
+            native_structured = _build_native_structured_payload(text, text_confidence, all_sections)
+            overall_accuracy = calculate_overall_accuracy()
+            local_resume_id = _safe_int(request.form.get("local_resume_id"), default=1)
+            builder_response = _build_builder_response(
+                native_structured=native_structured,
+                overall_accuracy=overall_accuracy,
+                local_resume_id=local_resume_id,
+                filename=file.filename or "",
+            )
+            status_code = 200 if builder_response.get("success") else 422
+            return jsonify(builder_response), status_code
+
+        else:
+            result, conf = extract_section_with_corrections(
+                text=text,
+                section=section,
+                file_path=file_path,
+                filename=file.filename if file else "",
+                trace_context="api_parse_resume",
+            )
+            if result is None:
                 return jsonify({
                     "status": "error",
                     "message": f"Section {section} not available"
                 }), 500
-
-        else:
-            result, conf = extract_section_from_resume(text, section, file_path)
             result_data = result
             section_confidence = conf
 
@@ -1035,6 +1160,13 @@ def api_parse_resume():
 @app.route("/api/parse-all", methods=["POST"])
 def api_parse_all():
     file = request.files.get("resume")
+    response_mode = (request.form.get("response_mode") or request.form.get("output_mode") or "").strip().lower()
+    builder_mode_requested = response_mode in {
+        "builder",
+        "builder_compatible",
+        "normalized",
+        "builder_normalized",
+    }
 
     if not file:
         return jsonify({
@@ -1058,6 +1190,18 @@ def api_parse_all():
         
         
         overall_accuracy = calculate_overall_accuracy()
+
+        if builder_mode_requested:
+            native_structured = _build_native_structured_payload(text, text_confidence, all_sections)
+            local_resume_id = _safe_int(request.form.get("local_resume_id"), default=1)
+            builder_response = _build_builder_response(
+                native_structured=native_structured,
+                overall_accuracy=overall_accuracy,
+                local_resume_id=local_resume_id,
+                filename=file.filename or "",
+            )
+            status_code = 200 if builder_response.get("success") else 422
+            return jsonify(builder_response), status_code
         
         
         response = {
@@ -1075,8 +1219,7 @@ def api_parse_all():
         
         
         if STRUCTURED_OUTPUT_AVAILABLE:
-            all_sections["text"] = (text, text_confidence)
-            structured = generate_structured_resume(text, all_sections)
+            structured = _build_native_structured_payload(text, text_confidence, all_sections)
             response["structured"] = structured
         
         return jsonify(response)
@@ -1143,17 +1286,19 @@ def get_status():
             "handwriting_ocr": HANDWRITING_OCR_AVAILABLE,
             "model_training": MODEL_TRAINING_AVAILABLE,
             "training_data_preparator": TRAINING_DATA_PREPARATOR_AVAILABLE,
-            "feature_api_routes": FEATURE_API_ROUTES_AVAILABLE
+            "feature_api_routes": FEATURE_API_ROUTES_AVAILABLE,
+            "builder_schema_normalization": BUILDER_NORMALIZATION_AVAILABLE
         },
         "supported_sections": [
             "name", "fulltext", "skills", "education", "experience",
             "projects", "certifications", "languages", "interests",
             "achievements", "publications", "volunteer", "summary",
-            "structured" if STRUCTURED_OUTPUT_AVAILABLE else None
+            "structured" if STRUCTURED_OUTPUT_AVAILABLE else None,
+            "builder"
         ],
         "new_features": {
-            "continuous_learning": {
-                "description": "Collect user feedback to improve extraction accuracy over time",
+            "feedback_pipeline": {
+                "description": "Collect and analyze feedback to improve parser logic, section isolation, and training datasets",
                 "endpoints": ["/api/feedback", "/api/learning/stats", "/api/learning/pending"]
             },
             "handwriting_recognition": {
@@ -1187,13 +1332,50 @@ def api_extract_layout():
     file_path = os.path.join(UPLOAD_FOLDER, file.filename)
     file.save(file_path)
     try:
+        if not file.filename.lower().endswith(".pdf"):
+            text, _ = extract_text_from_pdf(file_path)
+            plain_text = clean_fulltext_format(text) if text else ""
+            fallback_html = f"<pre>{plain_text}</pre>" if plain_text else ""
+            return jsonify({
+                "status": "success",
+                "html_output": fallback_html,
+                "plain_text": plain_text,
+                "fallback": "non_pdf_plain_text",
+                "summary": {"text_elements": 0}
+            })
+
         result = extract_full_resume_html(file_path)
+        text, _ = extract_text_from_pdf(file_path)
+        plain_text = clean_fulltext_format(text) if text else ""
         if output_format == "html":
-            return jsonify({"status": "success", "html_output": result.html_output, "extraction_pipeline": ["PDF", "Extract text with positions", "Flow-based HTML reconstruction"], "summary": {"text_elements": len(result.text_elements)}})
+            html_output = result.html_output or ""
+            if not html_output.strip() and plain_text:
+                html_output = f"<pre>{plain_text}</pre>"
+            return jsonify({
+                "status": "success",
+                "html_output": html_output,
+                "plain_text": plain_text,
+                "extraction_pipeline": ["PDF", "Extract text with positions", "Flow-based HTML reconstruction"],
+                "summary": {"text_elements": len(result.text_elements)}
+            })
         else:
             return jsonify(result.json_output)
     except Exception as e:
         logger.error(f"Error in layout extraction: {e}")
+        try:
+            text, _ = extract_text_from_pdf(file_path)
+            plain_text = clean_fulltext_format(text) if text else ""
+            fallback_html = f"<pre>{plain_text}</pre>" if plain_text else ""
+            if plain_text:
+                return jsonify({
+                    "status": "success",
+                    "html_output": fallback_html,
+                    "plain_text": plain_text,
+                    "fallback": "layout_error_plain_text",
+                    "summary": {"text_elements": 0}
+                })
+        except Exception:
+            pass
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
@@ -1421,4 +1603,4 @@ if __name__ == "__main__":
     with app.app_context():
         cleanup_orphaned_entries()
     
-    app.run(host="127.0.0.1", port=8000, debug=True)
+    app.run(host="127.0.0.1", port=8001, debug=True)

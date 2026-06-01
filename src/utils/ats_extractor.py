@@ -172,14 +172,14 @@ def extract_ats_education(text: str) -> Tuple[str, float]:
     
     
     in_education_section = False
-    education_entries = -1
+    education_start_index = -1
     for idx, line in enumerate(lines):
         line_lower = line.lower().strip()
         
         
         if is_section_heading(line) and 'education' in line_lower:
             in_education_section = True
-            education_entries = idx
+            education_start_index = idx
             continue
         
         
