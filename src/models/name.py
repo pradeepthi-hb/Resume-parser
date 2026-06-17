@@ -871,21 +871,3 @@ def extract_name_from_resume(text, pdf_path=None):
 def extract_name_from_resume_simple(text):
     return extract_name_from_resume(text, None)
 
-
-
-
-
-
-if __name__ == '__main__':
-    from flask import request
-    
-    file = request.files["resume"]
-    file_path = os.path.join(UPLOAD_FOLDER, file.filename)
-    file.save(file_path)
-    text = extract_text_from_pdf(file_path)
-    name, confidence = extract_name_from_resume(text, file_path)
-
-    if name:
-        print(f"Name: {name}, Confidence: {confidence}")
-    else:
-        print("Name not found")

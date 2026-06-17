@@ -723,8 +723,3 @@ def extract_text_from_image(image_path):
         return "", 0.0
  
  
-if __name__ == '__main__':
-    pdf_path = "sample_resume.pdf"
-    text, confidence = extract_text_from_pdf(pdf_path)
-    print(f"Text: {text[:500]}...")
-    print(f"Confidence: {confidence}")

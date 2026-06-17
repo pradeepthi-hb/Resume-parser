@@ -205,6 +205,82 @@ class TestBuilderSchemaMapper(unittest.TestCase):
         self.assertEqual(experience[0]["startYear"], "2021")
         self.assertEqual(experience[0]["current"], True)
 
+    def test_repairs_shifted_structured_education_fields(self):
+        native = {
+            "name": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+            "summary": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+            "skills": {"raw_text": "", "structured_data": {"all_skills": []}, "confidence": 0.9},
+            "education": {
+                "raw_text": "",
+                "structured_data": {
+                    "entries": [
+                        {
+                            "degree": "Intermediate",
+                            "field": "Electronics and Communications",
+                            "school": "BE in Electronics and Communications, Matrusri Engineering College (2013-2017) - 59%",
+                            "year": "2017",
+                        },
+                        {
+                            "school": "Narayana Junior College",
+                            "gpa": "Intermediate, Narayana Junior College (2013) - 78%",
+                            "year": "2013",
+                        },
+                        {
+                            "school": "Shree Krishnaveni Talent High School",
+                            "gpa": "SSC, Shree Krishnaveni Talent High School (2011) - 84%",
+                            "year": "2011",
+                        },
+                    ]
+                },
+                "confidence": 0.9,
+            },
+            "experience": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.9},
+            "projects": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.0},
+            "certifications": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.0},
+            "languages": {"raw_text": "", "structured_data": {"languages": []}, "confidence": 0.0},
+            "email": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+            "phone": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+        }
+        response = BuilderSchemaMapper().map_parser_output(native, overall_confidence=90, local_resume_id=44, file_type="docx")
+        education = response["resume_data"]["education"]
+
+        self.assertEqual(education[0]["degree"], "BE")
+        self.assertEqual(education[0]["field"], "Electronics and Communications")
+        self.assertEqual(education[0]["school"], "Matrusri Engineering College")
+        self.assertEqual(education[0]["gpa"], "59%")
+        self.assertEqual(education[1]["degree"], "Intermediate")
+        self.assertEqual(education[1]["school"], "Narayana Junior College")
+        self.assertEqual(education[1]["gpa"], "78%")
+        self.assertEqual(education[2]["degree"], "SSC")
+        self.assertEqual(education[2]["school"], "Shree Krishnaveni Talent High School")
+        self.assertEqual(education[2]["gpa"], "84%")
+
+    def test_does_not_use_adjacent_degree_as_school(self):
+        native = {
+            "name": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+            "summary": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+            "skills": {"raw_text": "", "structured_data": {"all_skills": []}, "confidence": 0.9},
+            "education": {
+                "raw_text": "",
+                "structured_data": {
+                    "entries": [
+                        {"degree": "M.Com (Commerce)", "school": "B.Com (Commerce)", "year": "2019"},
+                    ]
+                },
+                "confidence": 0.9,
+            },
+            "experience": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.9},
+            "projects": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.0},
+            "certifications": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.0},
+            "languages": {"raw_text": "", "structured_data": {"languages": []}, "confidence": 0.0},
+            "email": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+            "phone": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+        }
+        response = BuilderSchemaMapper().map_parser_output(native, overall_confidence=90, local_resume_id=45, file_type="docx")
+        education = response["resume_data"]["education"]
+        self.assertEqual(education[0]["degree"], "M.Com (Commerce)")
+        self.assertEqual(education[0]["school"], "")
+
     def test_recovers_summary_from_raw_text_when_summary_section_missing(self):
         native = {
             "name": {"raw_text": "Alex Doe", "structured_data": {}, "confidence": 0.9},
@@ -383,6 +459,157 @@ class TestBuilderSchemaMapper(unittest.TestCase):
         self.assertFalse(any("PROFESSIONAL SUMMARY" in c["name"] for c in data["certifications"]))
         self.assertIn("Git", data["skills"])
         self.assertNotIn("Vs", data["skills"])
+
+    def test_raw_experience_does_not_promote_responsibilities_to_employers(self):
+        native = {
+            "name": {"raw_text": "Bandari Santhosh", "structured_data": {}, "confidence": 0.9},
+            "summary": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+            "skills": {"raw_text": "", "structured_data": {"all_skills": []}, "confidence": 0.9},
+            "education": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.9},
+            "experience": {
+                "raw_text": (
+                    "Estron International - A Unit of Sigma Racks\n"
+                    "April 2026 - Present\n"
+                    "Identifying and evaluating vendors\n"
+                    "Negotiating pricing, payment terms, and delivery schedules\n"
+                    "Coordinating with suppliers\n"
+                    "Intern Mechanical Design Engineer Profex Engineering\n"
+                    "Jan 2026 - March 2026\n"
+                    "Designed mechanical components and assemblies using Creo\n"
+                    "Junior Officer - Purchase Engineer Hetero Drugs\n"
+                    "June 2022 - March 2024\n"
+                    "Negotiated supplier contracts to secure favorable pricing\n"
+                    "Managed purchase orders ensuring accuracy"
+                ),
+                "structured_data": {"entries": []},
+                "confidence": 0.9,
+            },
+            "projects": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.0},
+            "certifications": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.0},
+            "languages": {"raw_text": "", "structured_data": {"languages": []}, "confidence": 0.0},
+            "email": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+            "phone": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+        }
+        response = BuilderSchemaMapper().map_parser_output(native, overall_confidence=90, local_resume_id=38, file_type="docx")
+        experience = response["resume_data"]["experience"]
+
+        self.assertEqual(len(experience), 3)
+        self.assertEqual(experience[0]["employer"], "Estron International - A Unit of Sigma Racks")
+        self.assertEqual(experience[0]["title"], "")
+        self.assertIn("Negotiating pricing", experience[0]["description"])
+        self.assertEqual(experience[1]["title"], "Mechanical Design Engineer")
+        self.assertEqual(experience[1]["employer"], "Profex Engineering")
+        self.assertEqual(experience[2]["title"], "Officer Purchase Engineer")
+        self.assertEqual(experience[2]["employer"], "Hetero Drugs")
+        self.assertFalse(any("Negotiated supplier contracts" in item["employer"] for item in experience))
+
+    def test_cleans_repeated_linkedin_protocol_and_profession_company_prefix(self):
+        native = {
+            "name": {"raw_text": "Rukaiya Tajani", "structured_data": {}, "confidence": 0.9},
+            "raw_text": {
+                "raw_text": "https://https: //https: //linkedin.com/in/rukaiya-tajani-aa43261b7",
+                "structured_data": {},
+                "confidence": 0.9,
+            },
+            "summary": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+            "skills": {"raw_text": "", "structured_data": {"all_skills": []}, "confidence": 0.9},
+            "education": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.9},
+            "experience": {
+                "raw_text": "",
+                "structured_data": {
+                    "entries": [
+                        {
+                            "title": "ADP Solutions - Analyst (UK Payroll)",
+                            "company": "",
+                            "duration": "Apr 2025 - Present",
+                            "description": "Lead end-to-end UK payroll cycles.",
+                        }
+                    ]
+                },
+                "confidence": 0.9,
+            },
+            "projects": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.0},
+            "certifications": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.0},
+            "languages": {"raw_text": "", "structured_data": {"languages": []}, "confidence": 0.0},
+            "email": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+            "phone": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+        }
+        response = BuilderSchemaMapper().map_parser_output(native, overall_confidence=90, local_resume_id=39, file_type="docx")
+        personal = response["resume_data"]["personal"]
+
+        self.assertEqual(personal["linkedin"], "https://linkedin.com/in/rukaiya-tajani-aa43261b7")
+        self.assertEqual(personal["profession"], "Analyst (UK Payroll)")
+        self.assertEqual(personal["websites"], [])
+
+    def test_normalizes_payroll_skill_acronyms(self):
+        native = {
+            "name": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+            "summary": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+            "skills": {
+                "raw_text": "",
+                "structured_data": {
+                    "all_skills": [
+                        "adp ihcm",
+                        "hmrc edi and query resolution",
+                        "fps/eps",
+                        "qa checks",
+                        "sla tracking/reporting",
+                        "powerpoint",
+                    ]
+                },
+                "confidence": 0.9,
+            },
+            "education": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.9},
+            "experience": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.9},
+            "projects": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.0},
+            "certifications": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.0},
+            "languages": {"raw_text": "", "structured_data": {"languages": []}, "confidence": 0.0},
+            "email": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+            "phone": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+        }
+        response = BuilderSchemaMapper().map_parser_output(native, overall_confidence=90, local_resume_id=45, file_type="docx")
+        self.assertEqual(
+            response["resume_data"]["skills"],
+            ["ADP iHCM", "HMRC EDI and Query Resolution", "FPS/EPS", "QA Checks", "SLA Tracking/Reporting", "PowerPoint"],
+        )
+
+    def test_rejects_skill_phrase_as_person_name(self):
+        native = {
+            "name": {"raw_text": "Requirements Gathering Data Analysis", "structured_data": {}, "confidence": 0.9},
+            "summary": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+            "skills": {
+                "raw_text": "",
+                "structured_data": {"all_skills": ["Requirements Gathering & Data Analysis"]},
+                "confidence": 0.9,
+            },
+            "education": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.9},
+            "experience": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.9},
+            "projects": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.0},
+            "certifications": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.0},
+            "languages": {"raw_text": "", "structured_data": {"languages": []}, "confidence": 0.0},
+            "email": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+            "phone": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+        }
+        response = BuilderSchemaMapper().map_parser_output(native, overall_confidence=90, local_resume_id=44, file_type="docx")
+        self.assertEqual(response["resume_data"]["personal"]["firstName"], "")
+        self.assertEqual(response["resume_data"]["personal"]["lastName"], "")
+
+    def test_languages_can_be_recovered_from_raw_text_when_section_confidence_is_low(self):
+        native = {
+            "name": {"raw_text": "Rukaiya Tajani", "structured_data": {}, "confidence": 0.9},
+            "raw_text": {"raw_text": "LANGUAGES\nEnglish\nHindi\nGujarati\nSKILLS\nPayroll", "structured_data": {}, "confidence": 0.9},
+            "summary": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+            "skills": {"raw_text": "", "structured_data": {"all_skills": []}, "confidence": 0.9},
+            "education": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.9},
+            "experience": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.9},
+            "projects": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.0},
+            "certifications": {"raw_text": "", "structured_data": {"entries": []}, "confidence": 0.0},
+            "languages": {"raw_text": "", "structured_data": {"languages": []}, "confidence": 0.0},
+            "email": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+            "phone": {"raw_text": "", "structured_data": {}, "confidence": 0.0},
+        }
+        response = BuilderSchemaMapper().map_parser_output(native, overall_confidence=90, local_resume_id=39, file_type="docx")
+        self.assertEqual([item["name"] for item in response["resume_data"]["languages"]], ["English", "Hindi", "Gujarati"])
 
 
 if __name__ == "__main__":

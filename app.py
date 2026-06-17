@@ -8,6 +8,7 @@ from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTTextContainer
 
 from flask import Flask, render_template, request, jsonify, redirect, url_for
+from werkzeug.utils import secure_filename
 
 
 app = Flask(__name__)
@@ -18,12 +19,38 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def _load_local_env_file() -> None:
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(env_path):
+        return
+    try:
+        with open(env_path, "r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except OSError as env_error:
+        logger.warning("Could not load .env file: %s", env_error)
+
+
+_load_local_env_file()
+
 from src.models.models import db, init_database, save_resume, get_resume, get_all_resumes, delete_resume, update_resume, search_resumes
 from src.utils.text import extract_text_from_pdf
 from src.utils.section_extractor import extract_section_from_resume
 from src.models.name import extract_name_from_resume
 from src.utils.formatter import clean_fulltext_format
 from src.utils.headings import detect_headings
+from src.extractors.extractor_factory import SUPPORTED_EXTENSIONS, extract_text_from_upload
+from src.utils.parser_orchestrator import is_ai_enabled, parse_resume_to_schema_v1
+from normalizers.resume_schema_v1_to_builder import build_resume_builder_response
+from normalizers.resume_schema_v1_section_mapper import resume_schema_v1_section_text
 from normalizers.builder_schema_mapper import get_builder_schema_mapper, infer_file_type
 
 try:
@@ -152,6 +179,52 @@ UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+
+
+def _is_supported_resume_file(filename: str) -> bool:
+    return os.path.splitext(filename or "")[1].lower() in SUPPORTED_EXTENSIONS
+
+
+def _save_upload(file) -> str:
+    safe_name = secure_filename(file.filename or "")
+    if not safe_name:
+        raise ValueError("Resume filename is required")
+    if not _is_supported_resume_file(safe_name):
+        raise ValueError(
+            "Unsupported resume format. Supported formats: "
+            + ", ".join(sorted(SUPPORTED_EXTENSIONS))
+        )
+    file_path = os.path.join(UPLOAD_FOLDER, safe_name)
+    file.save(file_path)
+    return file_path
+
+
+def _parse_text_resume_schema_v1(
+    text: str,
+    filename: str,
+    file_path: Optional[str],
+) -> Dict[str, Any]:
+    return parse_resume_to_schema_v1(
+        text=text,
+        filename=filename or "",
+        file_path=file_path,
+        classic_extractor=extract_all_sections,
+    )
+
+
+def _parse_uploaded_resume_schema_v1(file) -> Dict[str, Any]:
+    if not file or not file.filename:
+        raise ValueError("Resume file is required")
+    file_path = _save_upload(file)
+    text, _ = extract_text_from_upload(file_path)
+    if not text or not text.strip():
+        raise ValueError("Could not extract text from the uploaded resume")
+
+    result = _parse_text_resume_schema_v1(text, file.filename or "", file_path)
+    result["filename"] = file.filename
+    result["extracted_text"] = text
+    result["file_type"] = infer_file_type(file.filename or "")
+    return result
 
 
 def cleanup_orphaned_entries():
@@ -502,12 +575,12 @@ def extract_name_with_filename_fallback(text: str, filename: str, pdf_path: Opti
         
         
         name_from_file = os.path.splitext(filename)[0]
-        
-        
+        name_from_file = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", name_from_file)
+        name_from_file = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name_from_file)
         name_from_file = name_from_file.replace('_', ' ').replace('-', ' ')
         
         
-        common_words = ['resume', 'cv', 'curriculum', 'vitae', 'document', 'file']
+        common_words = ['resume', 'cv', 'curriculum', 'vitae', 'document', 'file', 'naukri']
         name_parts = name_from_file.split()
         name_parts = [part for part in name_parts if part.lower() not in common_words]
         name_from_file = ' '.join(name_parts)
@@ -733,69 +806,152 @@ def home():
                 resume_text = clean_fulltext_format(text)
                 
                 
-                pdf_path_for_layoutlm = file_path
-                
-                skills_section, skills_confidence = extract_section_from_resume(
-                    text, "skills", pdf_path_for_layoutlm
-                )
-                confidence_scores["skills_confidence"] = skills_confidence
-                
-                extracted_education, education_confidence = extract_section_from_resume(
-                    text, "education", pdf_path_for_layoutlm
-                )
-                confidence_scores["education_confidence"] = education_confidence
-                
-                experience_section, experience_confidence = extract_section_from_resume(
-                    text, "experience", pdf_path_for_layoutlm
-                )
-                confidence_scores["experience_confidence"] = experience_confidence
-                
-                certifications, cert_confidence = extract_section_from_resume(
-                    text, "certifications", pdf_path_for_layoutlm
-                )
-                confidence_scores["certifications_confidence"] = cert_confidence
-                
-                projects, projects_confidence = extract_section_from_resume(
-                    text, "projects", pdf_path_for_layoutlm
-                )
-                confidence_scores["projects_confidence"] = projects_confidence
-                
-                
-                awards_section = ""
-                awards_confidence = 0.0
-                try:
-                    awards_section, awards_confidence = extract_section_from_resume(text, "awards", pdf_path_for_layoutlm)
+                # Dropdown sections: AI-first when available; otherwise fall back to legacy extraction
+                schema_result: Optional[Dict[str, Any]] = None
+                if is_ai_enabled():
+                    try:
+                        schema_result = _parse_text_resume_schema_v1(
+                            text=text,
+                            filename=original_filename,
+                            file_path=file_path,
+                        )
+                    except Exception as e:
+                        logger.warning(f"AI schema parsing failed; using legacy extraction. Error: {e}")
+                        schema_result = None
+
+                if schema_result and schema_result.get("validation", {}).get("is_valid") and schema_result.get("resume"):
+                    # AI-first: use ResumeSchemaV1 output for dropdowns
+                    resume_schema = schema_result["resume"]
+
+
+                    def _get_section_text(key: str) -> str:
+                        v = resume_schema.get(key)
+                        if isinstance(v, str):
+                            return v
+                        if isinstance(v, dict):
+                            # try common fields
+                            return v.get("raw_text") or v.get("text") or v.get("value") or ""
+                        return ""
+
+                    def _get_section_conf(key: str) -> float:
+                        v = resume_schema.get(key)
+                        if isinstance(v, dict):
+                            # try confidence fields
+                            for ck in ("confidence", "score"):
+                                if ck in v:
+                                    try:
+                                        return float(v.get(ck) or 0.0)
+                                    except Exception:
+                                        pass
+                        return 0.0
+
+                    skills_section = _get_section_text("skills")
+                    skills_confidence = _get_section_conf("skills")
+                    extracted_education = _get_section_text("education")
+                    education_confidence = _get_section_conf("education")
+                    experience_section = _get_section_text("experience")
+                    experience_confidence = _get_section_conf("experience")
+                    certifications = _get_section_text("certifications")
+                    cert_confidence = _get_section_conf("certifications")
+                    projects = _get_section_text("projects")
+                    projects_confidence = _get_section_conf("projects")
+                    awards_section = _get_section_text("awards")
+                    awards_confidence = _get_section_conf("awards")
+                    references_section = _get_section_text("references")
+                    references_confidence = _get_section_conf("references")
+
+                    confidence_scores["skills_confidence"] = skills_confidence
+                    confidence_scores["education_confidence"] = education_confidence
+                    confidence_scores["experience_confidence"] = experience_confidence
+                    confidence_scores["certifications_confidence"] = cert_confidence
+                    confidence_scores["projects_confidence"] = projects_confidence
                     confidence_scores["awards_confidence"] = awards_confidence
-                except Exception as e:
-                    logger.error(f"Error extracting awards: {e}")
-                
-                references_section = ""
-                references_confidence = 0.0
-                try:
-                    references_section, references_confidence = extract_section_from_resume(text, "references", pdf_path_for_layoutlm)
                     confidence_scores["references_confidence"] = references_confidence
-                except Exception as e:
-                    logger.error(f"Error extracting references: {e}")
-                
-                
-                if NEW_SECTIONS_AVAILABLE:
-                    languages_section, languages_conf = extract_languages_from_resume(text)
+
+                    # New sections in schema (when present)
+                    languages_section = _get_section_text("languages")
+                    languages_conf = _get_section_conf("languages")
+                    interests_section = _get_section_text("interests")
+                    interests_conf = _get_section_conf("interests")
+                    achievements_section = _get_section_text("achievements")
+                    achievements_conf = _get_section_conf("achievements")
+                    publications_section = _get_section_text("publications")
+                    publications_conf = _get_section_conf("publications")
+                    volunteer_section = _get_section_text("volunteer")
+                    volunteer_conf = _get_section_conf("volunteer")
+                    summary_section = _get_section_text("summary")
+                    summary_conf = _get_section_conf("summary")
+
                     confidence_scores["languages_confidence"] = languages_conf
-                    
-                    interests_section, interests_conf = extract_interests_from_resume(text)
                     confidence_scores["interests_confidence"] = interests_conf
-                    
-                    achievements_section, achievements_conf = extract_achievements_from_resume(text)
                     confidence_scores["achievements_confidence"] = achievements_conf
-                    
-                    publications_section, publications_conf = extract_publications_from_resume(text)
                     confidence_scores["publications_confidence"] = publications_conf
-                    
-                    volunteer_section, volunteer_conf = extract_volunteer_from_resume(text)
                     confidence_scores["volunteer_confidence"] = volunteer_conf
-                    
-                    summary_section, summary_conf = extract_summary_from_resume(text)
                     confidence_scores["summary_confidence"] = summary_conf
+                else:
+                    # Legacy extraction fallback
+                    pdf_path_for_layoutlm = file_path
+
+                    skills_section, skills_confidence = extract_section_from_resume(
+                        text, "skills", pdf_path_for_layoutlm
+                    )
+                    confidence_scores["skills_confidence"] = skills_confidence
+
+                    extracted_education, education_confidence = extract_section_from_resume(
+                        text, "education", pdf_path_for_layoutlm
+                    )
+                    confidence_scores["education_confidence"] = education_confidence
+
+                    experience_section, experience_confidence = extract_section_from_resume(
+                        text, "experience", pdf_path_for_layoutlm
+                    )
+                    confidence_scores["experience_confidence"] = experience_confidence
+
+                    certifications, cert_confidence = extract_section_from_resume(
+                        text, "certifications", pdf_path_for_layoutlm
+                    )
+                    confidence_scores["certifications_confidence"] = cert_confidence
+
+                    projects, projects_confidence = extract_section_from_resume(
+                        text, "projects", pdf_path_for_layoutlm
+                    )
+                    confidence_scores["projects_confidence"] = projects_confidence
+
+                    awards_section = ""
+                    awards_confidence = 0.0
+                    try:
+                        awards_section, awards_confidence = extract_section_from_resume(text, "awards", pdf_path_for_layoutlm)
+                        confidence_scores["awards_confidence"] = awards_confidence
+                    except Exception as e:
+                        logger.error(f"Error extracting awards: {e}")
+
+                    references_section = ""
+                    references_confidence = 0.0
+                    try:
+                        references_section, references_confidence = extract_section_from_resume(text, "references", pdf_path_for_layoutlm)
+                        confidence_scores["references_confidence"] = references_confidence
+                    except Exception as e:
+                        logger.error(f"Error extracting references: {e}")
+
+                    if NEW_SECTIONS_AVAILABLE:
+                        languages_section, languages_conf = extract_languages_from_resume(text)
+                        confidence_scores["languages_confidence"] = languages_conf
+
+                        interests_section, interests_conf = extract_interests_from_resume(text)
+                        confidence_scores["interests_confidence"] = interests_conf
+
+                        achievements_section, achievements_conf = extract_achievements_from_resume(text)
+                        confidence_scores["achievements_confidence"] = achievements_conf
+
+                        publications_section, publications_conf = extract_publications_from_resume(text)
+                        confidence_scores["publications_confidence"] = publications_conf
+
+                        volunteer_section, volunteer_conf = extract_volunteer_from_resume(text)
+                        confidence_scores["volunteer_confidence"] = volunteer_conf
+
+                        summary_section, summary_conf = extract_summary_from_resume(text)
+                        confidence_scores["summary_confidence"] = summary_conf
+
                 
                 selected_section = request.form.get("section")
                 section = request.form.get("section")
@@ -893,16 +1049,25 @@ def extract_ajax():
         return jsonify({"result": "Invalid input"}), 400
 
     try:
+        if is_ai_enabled():
+            resume_id = _safe_int(request.form.get("resume_id"), default=0)
+            if resume_id:
+                stored_resume = get_resume(resume_id)
+                stored_schema = stored_resume.structured_data if stored_resume else None
+                if isinstance(stored_schema, dict) and "personal_information" in stored_schema:
+                    return jsonify({
+                        "result": resume_schema_v1_section_text(stored_schema, section),
+                        "confidence": 1.0,
+                        "overall_accuracy": calculate_overall_accuracy(),
+                        "resume_id": resume_id,
+                    })
+
         file_path = os.path.join(UPLOAD_FOLDER, file.filename)
         file.save(file_path)
-
         text, text_confidence = extract_text_from_pdf(file_path)
-        
-        result_data = {"result": "", "confidence": 0.0}
 
         if section == "fulltext":
-            result = clean_fulltext_format(text)
-            result_data = {"result": result, "confidence": text_confidence}
+            result_data = {"result": clean_fulltext_format(text), "confidence": text_confidence}
         else:
             result, conf = extract_section_with_corrections(
                 text=text,
@@ -911,25 +1076,12 @@ def extract_ajax():
                 filename=file.filename if file else "",
                 trace_context="extract_ajax",
             )
-            if result is None:
-                result_data = {"result": "Section not available", "confidence": 0.0}
-            else:
-                result_data = {"result": result, "confidence": conf}
+            result_data = {"result": result if result is not None else "Section not available", "confidence": conf if result is not None else 0.0}
 
-        overall_accuracy = calculate_overall_accuracy()
-        result_data["overall_accuracy"] = overall_accuracy
-        
-        
-        try:
-            from src.models.models import get_all_resumes
-            resumes = get_all_resumes()
-            if resumes:
-                result_data["resume_id"] = resumes[-1].id
-        except:
-            pass
-        
+        result_data["overall_accuracy"] = calculate_overall_accuracy()
+        if request.form.get("resume_id"):
+            result_data["resume_id"] = _safe_int(request.form.get("resume_id"), default=0)
         return jsonify(result_data)
-    
     except Exception as e:
         logger.error(f"Error in extract_ajax: {e}")
         return jsonify({"error": str(e)}), 500
@@ -945,11 +1097,9 @@ def detect_headings_api():
             "message": "Resume file is required"
         }), 400
 
-    file_path = os.path.join(UPLOAD_FOLDER, file.filename)
-    file.save(file_path)
-
     try:
-        text, text_confidence = extract_text_from_pdf(file_path)
+        file_path = _save_upload(file)
+        text, text_confidence = extract_text_from_upload(file_path)
         
         if not text or len(text.strip()) < 10:
             ext = os.path.splitext(file.filename or "")[1].lower()
@@ -963,6 +1113,48 @@ def detect_headings_api():
                 "status": "error",
                 "message": "Could not extract text from the resume"
             }), 400
+
+        if is_ai_enabled():
+            logger.info(
+                "[AI] /detect-headings entered: filename=%s len(text)=%s AI_ENABLED=%s",
+                getattr(file, 'filename', None),
+                len(text or ''),
+                os.getenv("AI_ENABLED"),
+            )
+            schema_result = _parse_text_resume_schema_v1(text, file.filename or "", file_path)
+            logger.info(
+                "[AI] /detect-headings schema_result: parser_mode=%s fallback_used=%s fallback_reason=%s validation_is_valid=%s",
+                schema_result.get("parser_mode"),
+                schema_result.get("fallback_used"),
+                schema_result.get("fallback_reason"),
+                schema_result.get("validation", {}).get("is_valid"),
+            )
+            resume = save_resume(
+
+                filename=file.filename,
+                structured_data=schema_result["resume"],
+                extracted_text=text,
+                layout_html="",
+                original_pdf_path=file_path
+            )
+            return jsonify({
+                "status": "success",
+                "headings": [],
+                "headings_confidence": 0.0,
+                "text_confidence": text_confidence,
+                "all_sections": [],
+                "full_text": text,
+                "saved_resume_id": resume.id,
+                "resume_id": resume.id,
+                "filename": resume.filename,
+                "schema_version": schema_result.get("schema_version"),
+                "parser_mode": schema_result.get("parser_mode"),
+                "fallback_used": schema_result.get("fallback_used", False),
+                "fallback_reason": schema_result.get("fallback_reason"),
+                "validation": schema_result.get("validation", {}),
+                "resume_schema_v1": schema_result.get("resume", {}),
+            })
+
         
         headings, headings_confidence = detect_headings(text)
         heading_texts = [heading[1] for heading in headings]
@@ -1058,9 +1250,8 @@ def api_parse_resume():
         }), 400
 
     try:
-        file_path = os.path.join(UPLOAD_FOLDER, file.filename)
-        file.save(file_path)
-        text, text_confidence = extract_text_from_pdf(file_path)
+        file_path = _save_upload(file)
+        text, text_confidence = extract_text_from_upload(file_path)
     except Exception as e:
         logger.error(f"Error extracting text: {e}")
         return jsonify({
@@ -1103,15 +1294,13 @@ def api_parse_resume():
                     }
                 }), 500
 
-            all_sections = extract_all_sections(text, file_path)
-            native_structured = _build_native_structured_payload(text, text_confidence, all_sections)
-            overall_accuracy = calculate_overall_accuracy()
+            schema_result = _parse_text_resume_schema_v1(text, file.filename or "", file_path)
             local_resume_id = _safe_int(request.form.get("local_resume_id"), default=1)
-            builder_response = _build_builder_response(
-                native_structured=native_structured,
-                overall_accuracy=overall_accuracy,
+            builder_response = build_resume_builder_response(
+                resume=schema_result.get("resume", {}),
+                validation=schema_result.get("validation", {}),
                 local_resume_id=local_resume_id,
-                filename=file.filename or "",
+                file_type=infer_file_type(file.filename or ""),
             )
             status_code = 200 if builder_response.get("success") else 422
             return jsonify(builder_response), status_code
@@ -1175,9 +1364,8 @@ def api_parse_all():
         }), 400
 
     try:
-        file_path = os.path.join(UPLOAD_FOLDER, file.filename)
-        file.save(file_path)
-        text, text_confidence = extract_text_from_pdf(file_path)
+        file_path = _save_upload(file)
+        text, text_confidence = extract_text_from_upload(file_path)
     except Exception as e:
         return jsonify({
             "status": "error",
@@ -1185,6 +1373,61 @@ def api_parse_all():
         }), 500
 
     try:
+        if is_ai_enabled():
+            logger.info(
+                "[AI] /api/parse-all entered: filename=%s len(text)=%s local_resume_id=%s",
+                getattr(file, 'filename', None),
+                len(text or ''),
+                request.form.get("local_resume_id"),
+            )
+            schema_result = _parse_text_resume_schema_v1(text, file.filename or "", file_path)
+            logger.info(
+                "[AI] /api/parse-all schema_result: parser_mode=%s fallback_used=%s fallback_reason=%s validation_is_valid=%s",
+                schema_result.get("parser_mode"),
+                schema_result.get("fallback_used"),
+                schema_result.get("fallback_reason"),
+                schema_result.get("validation", {}).get("is_valid"),
+            )
+            local_resume_id = _safe_int(request.form.get("local_resume_id"), default=1)
+
+
+            if builder_mode_requested:
+                builder_response = build_resume_builder_response(
+                    resume=schema_result.get("resume", {}),
+                    validation=schema_result.get("validation", {}),
+                    local_resume_id=local_resume_id,
+                    file_type=infer_file_type(file.filename or ""),
+                )
+                status_code = 200 if builder_response.get("success") else 422
+                return jsonify(builder_response), status_code
+
+            resume_schema = schema_result.get("resume", {})
+            section_names = [
+                "name", "email", "phone", "summary", "skills", "education",
+                "experience", "projects", "volunteer", "certifications",
+                "awards", "languages", "references"
+            ]
+            sections = {
+                name: {
+                    "data": resume_schema_v1_section_text(resume_schema, name),
+                    "confidence": 1.0,
+                }
+                for name in section_names
+            }
+            return jsonify({
+                "status": "success",
+                "schema_version": schema_result.get("schema_version"),
+                "parser_mode": schema_result.get("parser_mode"),
+                "fallback_used": schema_result.get("fallback_used", False),
+                "fallback_reason": schema_result.get("fallback_reason"),
+                "validation": schema_result.get("validation", {}),
+                "text_confidence": text_confidence,
+                "sections": sections,
+                "structured": resume_schema,
+                "resume_schema_v1": resume_schema,
+            })
+
+
         
         all_sections = extract_all_sections(text, file_path)
         
@@ -1192,13 +1435,13 @@ def api_parse_all():
         overall_accuracy = calculate_overall_accuracy()
 
         if builder_mode_requested:
-            native_structured = _build_native_structured_payload(text, text_confidence, all_sections)
+            schema_result = _parse_text_resume_schema_v1(text, file.filename or "", file_path)
             local_resume_id = _safe_int(request.form.get("local_resume_id"), default=1)
-            builder_response = _build_builder_response(
-                native_structured=native_structured,
-                overall_accuracy=overall_accuracy,
+            builder_response = build_resume_builder_response(
+                resume=schema_result.get("resume", {}),
+                validation=schema_result.get("validation", {}),
                 local_resume_id=local_resume_id,
-                filename=file.filename or "",
+                file_type=infer_file_type(file.filename or ""),
             )
             status_code = 200 if builder_response.get("success") else 422
             return jsonify(builder_response), status_code
@@ -1287,16 +1530,23 @@ def get_status():
             "model_training": MODEL_TRAINING_AVAILABLE,
             "training_data_preparator": TRAINING_DATA_PREPARATOR_AVAILABLE,
             "feature_api_routes": FEATURE_API_ROUTES_AVAILABLE,
-            "builder_schema_normalization": BUILDER_NORMALIZATION_AVAILABLE
+            "builder_schema_normalization": BUILDER_NORMALIZATION_AVAILABLE,
+            "ai_resume_schema_v1": True,
+            "ai_enabled": os.getenv("AI_ENABLED", "false").strip().lower() == "true",
+            "supported_resume_formats": sorted(SUPPORTED_EXTENSIONS)
         },
         "supported_sections": [
             "name", "fulltext", "skills", "education", "experience",
             "projects", "certifications", "languages", "interests",
             "achievements", "publications", "volunteer", "summary",
             "structured" if STRUCTURED_OUTPUT_AVAILABLE else None,
-            "builder"
+            "builder", "resume_schema_v1"
         ],
         "new_features": {
+            "ai_resume_schema_v1": {
+                "description": "AI-first parser with classic fallback returning the unified ResumeSchemaV1 contract",
+                "endpoints": ["/detect-headings", "/api/parse", "/api/parse-all"]
+            },
             "feedback_pipeline": {
                 "description": "Collect and analyze feedback to improve parser logic, section isolation, and training datasets",
                 "endpoints": ["/api/feedback", "/api/learning/stats", "/api/learning/pending"]

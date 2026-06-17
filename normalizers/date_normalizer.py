@@ -75,6 +75,7 @@ def normalize_month(value: Any) -> Tuple[str, bool]:
 
 def normalize_year(value: Any) -> Tuple[str, bool]:
     token = clean_ocr_text(value)
+    token = re.sub(r"[–—−]", "-", token)
     if not token:
         return "", False
     range_match = _YEAR_RANGE_RE.search(token)
@@ -96,6 +97,7 @@ def normalize_year(value: Any) -> Tuple[str, bool]:
 
 def extract_date_range(text: Any) -> Dict[str, Any]:
     raw = clean_ocr_text(text)
+    raw = re.sub(r"[–—−]", "-", raw)
     issues: List[str] = []
     if not raw:
         return {

@@ -378,18 +378,3 @@ def extract_all_sections_optimized(
     return results
 
 
-if __name__ == "__main__":
-    
-    print("Testing cache...")
-    text_cache.set("test_key", "test_value", 60)
-    print("Cache get:", text_cache.get("test_key"))
-    print("Cache size:", text_cache.size())
-    
-    
-    @timeit
-    def test_function():
-        time.sleep(0.1)
-        return "done"
-    
-    test_function()
-    print("Metrics:", get_performance_metrics().get_all_stats())

@@ -179,7 +179,8 @@ SECTION_PATTERNS = {
         r'\b(20\d{2}|19\d{2})\b',
         r'\b(university|college|institute|school)\b',
         r'\b(gpa|grade|percentage|score)\b',
-        r'\b(degree|graduation|passed)\b'
+        r'\b(degree|graduation|passed)\b',
+        r'\b(location|place))\b'
     ],
     "projects": [
         r'\b(developed|built|created|designed|implemented|led)\b',
@@ -526,97 +527,289 @@ def calculate_section_confidence(section_text, original_text, section_type):
     return round(min(confidence, 1.0), 2)
 
 
-def extract_section_by_type(text, section_type):
-    if not text:
-        return "", 0.0
+# def extract_section_by_type(text, section_type):
+#     if not text:
+#         return "", 0.0
     
-    keywords = SECTION_KEYWORDS.get(section_type.lower(), [])
-    stops = STOP_KEYWORDS.get(section_type.lower(), [])
+#     keywords = SECTION_KEYWORDS.get(section_type.lower(), [])
+#     stops = STOP_KEYWORDS.get(section_type.lower(), [])
     
-    lines = text.splitlines()
-    section_lines = []
-    capture = False
-    header_found = False
+#     lines = text.splitlines()
+#     section_lines = []
+#     capture = False
+#     header_found = False
     
-    for line in lines:
-        line_stripped = line.strip()
-        if not line_stripped:
-            continue
+#     for line in lines:
+#         line_stripped = line.strip()
+#         if not line_stripped:
+#             continue
             
-        line_lower = line_stripped.lower()
+#         line_lower = line_stripped.lower()
   
-        is_header = False
-        for keyword in keywords:
+#         is_header = False
+#         for keyword in keywords:
            
-            if line_lower == keyword:
-                is_header = True
-                break
+#             if line_lower == keyword:
+#                 is_header = True
+#                 break
       
             
-            if len(line_stripped) < 50:
+#             if len(line_stripped) < 50:
              
-                if line_lower.startswith(keyword) or re.match(rf'^{re.escape(keyword)}[\s:\-–—]+', line_lower):
-                    is_header = True
-                    break
+#                 if line_lower.startswith(keyword) or re.match(rf'^{re.escape(keyword)}[\s:\-–—]+', line_lower):
+#                     is_header = True
+#                     break
                 
-                if keyword in line_lower and len(line_stripped) < 40:
+#                 if keyword in line_lower and len(line_stripped) < 40:
                    
-                    keyword_pos = line_lower.find(keyword)
-                    if keyword_pos == 0 or (keyword_pos > 0 and line_stripped[keyword_pos-1] in ' -:'):
-                        is_header = True
-                        break
+#                     keyword_pos = line_lower.find(keyword)
+#                     if keyword_pos == 0 or (keyword_pos > 0 and line_stripped[keyword_pos-1] in ' -:'):
+#                         is_header = True
+#                         break
         
-        if is_header:
-            capture = True
-            header_found = True
+#         if is_header:
+#             capture = True
+#             header_found = True
+#             continue
+
+
+#         if capture and header_found and len(section_lines) > 0:
+#             should_stop = False
+#             for stop in stops:
+           
+#                 if line_lower.startswith(stop) or re.match(rf'^{re.escape(stop)}[\s:\-–—]+', line_lower):
+#                     should_stop = True
+#                     break
+             
+#                 if line_lower == stop:
+#                     should_stop = True
+#                     break
+            
+#             if should_stop and len(section_lines) >= 2:
+#                 break
+            
+
+#             if not any(kw in line_lower for kw in keywords):
+#                 section_lines.append(line_stripped)
+    
+
+#     cleaned = []
+#     seen = set()
+#     separator_pattern = re.compile(r'^[-–—=_*#]+$')
+    
+#     for line in section_lines:
+        
+#         if len(line) < 2:
+#             continue
+        
+#         if separator_pattern.match(line):
+#             continue
+       
+#         if re.match(r'^(19|20)\d{2}(\s*[-–]\s*(19|20)\d{2})?$', line):
+#             continue
+       
+#         if line not in seen:
+#             cleaned.append(line)
+#             seen.add(line)
+    
+#     section_text = "\n".join(cleaned)
+
+#     confidence = calculate_section_confidence(section_text, text, section_type.lower())
+    
+#     logger.info(f"Extracted section '{section_type}'. Items found: {len(cleaned)}, Confidence: {confidence}")
+    
+#     return section_text, confidence
+
+def extract_section_by_type(text, section_type):
+    """
+    Robust section extraction using section boundary detection.
+    Prevents:
+    - Projects swallowing Languages
+    - Languages swallowing Declaration
+    - Experience swallowing Hobbies
+    - Education swallowing Skills
+    """
+
+    if not text:
+        return "", 0.0
+
+    section_type = section_type.lower()
+
+    lines = [line.rstrip() for line in text.splitlines()]
+
+    keywords = [
+        k.lower().strip()
+        for k in SECTION_KEYWORDS.get(section_type, [])
+    ]
+
+    if not keywords:
+        return "", 0.0
+
+    # ----------------------------------
+    # Build master header dictionary
+    # ----------------------------------
+
+    all_headers = set()
+
+    for values in SECTION_KEYWORDS.values():
+        for v in values:
+            all_headers.add(v.lower().strip())
+
+    def is_header(line):
+        line = line.strip().lower()
+
+        if not line:
+            return False
+
+        if len(line) > 60:
+            return False
+
+        normalized = re.sub(r"[:\-–—]+$", "", line).strip()
+
+        if normalized in all_headers:
+            return True
+
+        for header in all_headers:
+            if normalized.startswith(header):
+                return True
+
+        return False
+
+    # ----------------------------------
+    # Find section start
+    # ----------------------------------
+
+    start_index = None
+
+    for idx, line in enumerate(lines):
+
+        line_lower = line.strip().lower()
+
+        for keyword in keywords:
+
+            if (
+                line_lower == keyword
+                or re.match(
+                    rf"^{re.escape(keyword)}[\s:\-–—]*$",
+                    line_lower
+                )
+            ):
+                start_index = idx + 1
+                break
+
+        if start_index is not None:
+            break
+
+    if start_index is None:
+        return "", 0.0
+
+    # ----------------------------------
+    # Find next section header
+    # ----------------------------------
+
+    end_index = len(lines)
+
+    for idx in range(start_index, len(lines)):
+
+        candidate = lines[idx].strip()
+
+        if not candidate:
             continue
 
+        if is_header(candidate):
+            end_index = idx
+            break
 
-        if capture and header_found and len(section_lines) > 0:
-            should_stop = False
-            for stop in stops:
-           
-                if line_lower.startswith(stop) or re.match(rf'^{re.escape(stop)}[\s:\-–—]+', line_lower):
-                    should_stop = True
-                    break
-             
-                if line_lower == stop:
-                    should_stop = True
-                    break
-            
-            if should_stop and len(section_lines) >= 2:
-                break
-            
+    section_lines = []
 
-            if not any(kw in line_lower for kw in keywords):
-                section_lines.append(line_stripped)
-    
+    for line in lines[start_index:end_index]:
+
+        clean = line.strip()
+
+        if not clean:
+            continue
+
+        if re.match(r"^[-–—=_*#]+$", clean):
+            continue
+
+        if re.match(
+            r"^(19|20)\d{2}(\s*[-–]\s*(19|20)\d{2})?$",
+            clean
+        ):
+            continue
+
+        section_lines.append(clean)
+
+    # ----------------------------------
+    # Deduplicate
+    # ----------------------------------
 
     cleaned = []
     seen = set()
-    separator_pattern = re.compile(r'^[-–—=_*#]+$')
-    
-    for line in section_lines:
-        
-        if len(line) < 2:
-            continue
-        
-        if separator_pattern.match(line):
-            continue
-       
-        if re.match(r'^(19|20)\d{2}(\s*[-–]\s*(19|20)\d{2})?$', line):
-            continue
-       
-        if line not in seen:
-            cleaned.append(line)
-            seen.add(line)
-    
+
+    for item in section_lines:
+
+        normalized = re.sub(
+            r"\s+",
+            " ",
+            item.lower()
+        )
+
+        if normalized not in seen:
+            cleaned.append(item)
+            seen.add(normalized)
+
     section_text = "\n".join(cleaned)
 
-    confidence = calculate_section_confidence(section_text, text, section_type.lower())
-    
-    logger.info(f"Extracted section '{section_type}'. Items found: {len(cleaned)}, Confidence: {confidence}")
-    
+    confidence = calculate_section_confidence(
+        section_text,
+        text,
+        section_type
+    )
+
+    # ----------------------------------
+    # Penalties for contamination
+    # ----------------------------------
+
+    contamination_headers = [
+        "languages",
+        "declaration",
+        "references",
+        "hobbies",
+        "personal details",
+        "certifications",
+        "projects",
+        "education",
+        "experience",
+        "skills"
+    ]
+
+    contamination_count = 0
+
+    section_lower = section_text.lower()
+
+    for hdr in contamination_headers:
+
+        if hdr == section_type:
+            continue
+
+        if f"\n{hdr}\n" in f"\n{section_lower}\n":
+            contamination_count += 1
+
+    if contamination_count:
+        confidence *= max(
+            0.4,
+            1 - contamination_count * 0.2
+        )
+
+    confidence = round(max(0.0, min(confidence, 1.0)), 2)
+
+    logger.info(
+        f"Extracted section '{section_type}'. "
+        f"Items={len(cleaned)}, "
+        f"Confidence={confidence}"
+    )
+
     return section_text, confidence
 
 

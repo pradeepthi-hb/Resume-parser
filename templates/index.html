@@ -151,7 +151,7 @@
     </div>
 
     <script>
-        const defaultSections = [
+const defaultSections = [
             { value: "name", label: "Name" },
             { value: "summary", label: "Professional Summary" },
             { value: "skills", label: "Skills" },
@@ -163,7 +163,8 @@
             { value: "languages", label: "Languages" },
             { value: "interests", label: "Interests" },
             { value: "references", label: "References" },
-            { value: "fulltext", label: "Full Resume Text" }
+            { value: "fulltext", label: "Full Resume Text" },
+            { value: "initial_full", label: "Initial Parsed View" }
         ];
 
         const headingToSectionMap = {
@@ -266,7 +267,7 @@
             resumeFile.click();
         });
 
-        async function uploadFileAndDetectSections(file) {
+async function uploadFileAndDetectSections(file) {
             showLoading('Detecting sections...');
             updateNavStatus('processing', 'Processing...');
             sectionSelect.innerHTML = '<option value="">Detecting...</option>';
@@ -285,9 +286,18 @@
 
                 window.allSectionsData = data;
                 hydrateSectionStateFromAllSections();
+                // Keep the initial formatted cards view (the response that came from /detect-headings)
+                window.initialFullUploadResponse = data;
 
                 hideLoading();
                 updateNavStatus('ready', 'Ready');
+
+                if (data.status === "success" && data.resume_schema_v1) {
+                    populateSectionsFromResumeSchema(data.resume_schema_v1);
+                    showDetectedSections(Object.keys(data.resume_schema_v1).length);
+                    showResumeSchemaPreview(data.resume_schema_v1, data);
+                    return;
+                }
 
                 if (data.status === "success" && data.headings && data.headings.length > 0) {
                     populateSectionsFromHeadings(data.headings);
@@ -337,6 +347,36 @@
         function populateDefaultSections() {
             sectionSelect.innerHTML = '<option value="">Select section</option>';
             defaultSections.forEach(section => addSectionOption(section.value, section.label));
+        }
+
+function populateSectionsFromResumeSchema(schema) {
+            sectionSelect.innerHTML = '<option value="">Select section</option>';
+            const options = [
+                ["name", "Name"],
+                ["summary", "Summary"],
+                ["skills", "Skills"],
+                ["education", "Education"],
+                ["experience", "Work Experience"],
+                ["projects", "Projects"],
+                ["volunteer", "Volunteer Experience"],
+                ["certifications", "Certifications"],
+                ["awards", "Awards"],
+                ["languages", "Languages"],
+                ["references", "References"],
+                ["fulltext", "Full Text (Plain)"],
+                ["initial_full", "Initial Parsed View"]
+            ];
+            options.forEach(([value, label]) => {
+                const content = value === "fulltext"
+                    ? window.allSectionsData?.full_text
+                    : resumeSchemaSectionText(schema, value);
+                // Always add our navigation option.
+                if (value === "initial_full") {
+                    addSectionOption(value, label);
+                    return;
+                }
+                if (value === "fulltext" || content) addSectionOption(value, label);
+            });
         }
 
         function showDetectedSections(count, useDefault = false) {
@@ -431,6 +471,15 @@
             if (window.allSectionsData.full_text) {
                 setSectionState('fulltext', window.allSectionsData.full_text, 1);
             }
+            if (window.allSectionsData.resume_schema_v1) {
+                [
+                    "name", "summary", "skills", "education", "experience", "projects",
+                    "volunteer", "certifications", "awards", "languages", "references"
+                ].forEach(section => {
+                    const content = resumeSchemaSectionText(window.allSectionsData.resume_schema_v1, section);
+                    if (content) setSectionState(section, content, 1);
+                });
+            }
         }
 
         function getCanonicalSectionsList() {
@@ -468,10 +517,43 @@
             }
         }
 
-        sectionSelect.addEventListener('change', async function () {
+sectionSelect.addEventListener('change', async function () {
             const selectedSection = sectionSelect.value;
             const file = resumeFile.files[0];
             if (!file || !selectedSection) return;
+
+            if (selectedSection === 'initial_full') {
+                // Restore the same formatted “complete parsed result” view that was shown after upload
+                if (window.initialFullUploadResponse) {
+                    hideLoading();
+                    updateNavStatus('ready', 'Ready');
+                    resetToSingleColumn();
+                    // If the initial response includes schema_v1, render those cards
+                    if (window.initialFullUploadResponse.resume_schema_v1) {
+                        populateSectionsFromResumeSchema(window.initialFullUploadResponse.resume_schema_v1);
+                        showResumeSchemaPreview(window.initialFullUploadResponse.resume_schema_v1, window.initialFullUploadResponse);
+                        return;
+                    }
+                    // Otherwise, fallback to sections table view (formatted cards equivalent)
+                    showAllSectionsTable();
+                    return;
+                }
+            }
+
+            if (window.allSectionsData?.resume_schema_v1 && selectedSection !== "fulltext_layout") {
+                const content = selectedSection === "fulltext"
+                    ? (window.allSectionsData.full_text || "")
+                    : resumeSchemaSectionText(window.allSectionsData.resume_schema_v1, selectedSection);
+                setSectionState(selectedSection, content, 1);
+                if (selectedSection === "fulltext") {
+                    showFullTextWithSections(content, getCanonicalSectionsList());
+                } else {
+                    showResults(content || 'No data found', 1, false);
+                }
+                updateNavStatus('ready', 'Ready');
+                return;
+            }
+
 
             const cachedState = getSectionState(selectedSection);
             if (cachedState && selectedSection !== "fulltext_layout") {
@@ -558,6 +640,150 @@
             resultBox.style.display = 'block';
             document.getElementById('correctionBox').style.display = 'none';
             resetToSingleColumn();
+        }
+
+        function resumeSchemaSectionText(schema, section) {
+            if (!schema || typeof schema !== 'object') return '';
+            const key = String(section || '').replace(/-/g, '_').toLowerCase();
+            const personal = schema.personal_information || {};
+            if (key === 'name') return stringValue(personal.name || personal.full_name);
+            if (key === 'email') return stringValue(personal.email);
+            if (key === 'phone') return stringValue(personal.phone);
+            if (key === 'contact') return renderValueAsText(personal);
+            if (key === 'summary') return stringValue(schema.summary);
+            if (key === 'skills') return renderValueAsText(schema.skills);
+            if (key === 'education') return renderValueAsText(schema.education);
+            if (key === 'experience' || key === 'work_experience') return renderValueAsText(schema.work_experience);
+            if (key === 'projects') return renderValueAsText(schema.projects);
+            if (key === 'volunteer' || key === 'volunteer_experience') return renderValueAsText(schema.volunteer_experience);
+
+            const custom = findCustomSectionText(schema.custom_sections, key);
+            if (custom) return custom;
+            return renderValueAsText(schema[key]);
+        }
+
+        function findCustomSectionText(customSections, key) {
+            if (!Array.isArray(customSections)) return '';
+            const aliases = {
+                certifications: ['certifications', 'certification', 'licenses', 'courses'],
+                awards: ['awards', 'achievements', 'honors', 'recognition'],
+                languages: ['languages', 'language skills', 'known languages'],
+                references: ['references', 'referees'],
+                interests: ['interests', 'hobbies', 'passions'],
+                publications: ['publications', 'publication']
+            };
+            const wanted = aliases[key] || [key.replace(/_/g, ' ')];
+            const lines = [];
+            customSections.forEach(section => {
+                if (!section || typeof section !== 'object') return;
+                const title = stringValue(section.section_title).toLowerCase();
+                if (!wanted.includes(title)) return;
+                const text = renderValueAsText(section.items);
+                if (text) lines.push(text);
+            });
+            return lines.join('\n');
+        }
+
+        function renderValueAsText(value) {
+            if (value === null || value === undefined) return '';
+            if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+                return stringValue(value);
+            }
+            if (Array.isArray(value)) {
+                return value.map(renderValueAsText).filter(Boolean).join('\n\n');
+            }
+            if (typeof value === 'object') {
+                return Object.entries(value)
+                    .map(([key, item]) => {
+                        const rendered = renderValueAsText(item);
+                        return rendered ? `${humanize(key)}: ${rendered}` : '';
+                    })
+                    .filter(Boolean)
+                    .join('\n');
+            }
+            return '';
+        }
+
+        function showResumeSchemaPreview(schema, metadata = {}) {
+            const resultsContent = document.getElementById('resultsContent');
+            resultsContent.innerHTML = `
+                <div class="schema-preview">
+                    ${renderSchemaObject(schema)}
+                    <details class="schema-json-panel">
+                        <summary>Raw JSON</summary>
+                        <pre>${escapeHtml(JSON.stringify(schema || {}, null, 2))}</pre>
+                    </details>
+                </div>
+            `;
+            resultsContent.style.background = 'white';
+            document.getElementById('confidencePill').className = 'confidence-pill high';
+            document.getElementById('confidencePill').innerHTML = '<i class="fas fa-check"></i> Parsed';
+            resultBox.style.display = 'block';
+            document.getElementById('correctionBox').style.display = 'none';
+            resetToSingleColumn();
+        }
+
+        function renderSchemaObject(value, label = '') {
+            if (isEmptySchemaValue(value)) return '';
+            if (Array.isArray(value)) {
+                const items = value.map(item => renderSchemaObject(item)).filter(Boolean);
+                if (!items.length) return '';
+                return `
+                    <section class="schema-section">
+                        ${label ? `<h4>${humanize(label)}</h4>` : ''}
+                        <div class="schema-list">${items.join('')}</div>
+                    </section>
+                `;
+            }
+            if (value && typeof value === 'object') {
+                const primitiveFields = [];
+                const nestedFields = [];
+                Object.entries(value).forEach(([key, item]) => {
+                    if (isEmptySchemaValue(item)) return;
+                    if (item && typeof item === 'object') nestedFields.push([key, item]);
+                    else primitiveFields.push([key, item]);
+                });
+                if (!primitiveFields.length && !nestedFields.length) return '';
+                const fieldsHtml = primitiveFields.length ? `
+                    <div class="schema-field-grid">
+                        ${primitiveFields.map(([key, item]) => `
+                            <div class="schema-field">
+                                <span>${humanize(key)}</span>
+                                <strong>${escapeHtml(stringValue(item))}</strong>
+                            </div>
+                        `).join('')}
+                    </div>
+                ` : '';
+                return `
+                    <section class="schema-section">
+                        ${label ? `<h4>${humanize(label)}</h4>` : ''}
+                        ${fieldsHtml}
+                        ${nestedFields.map(([key, item]) => renderSchemaObject(item, key)).join('')}
+                    </section>
+                `;
+            }
+            return `<div class="schema-text">${escapeHtml(stringValue(value))}</div>`;
+        }
+
+        function isEmptySchemaValue(value) {
+            if (value === null || value === undefined) return true;
+            if (typeof value === 'string') return value.trim() === '';
+            if (Array.isArray(value)) return value.length === 0 || value.every(isEmptySchemaValue);
+            if (typeof value === 'object') return Object.values(value).every(isEmptySchemaValue);
+            return false;
+        }
+
+        function stringValue(value) {
+            if (value === null || value === undefined) return '';
+            return String(value).trim();
+        }
+
+        function humanize(value) {
+            return String(value || '')
+                .replace(/[_-]+/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .replace(/\b\w/g, char => char.toUpperCase());
         }
 
         function escapeHtml(text) {
@@ -736,6 +962,9 @@
             const formData = new FormData();
             formData.append('resume', file);
             formData.append('section', section);
+            if (window.latestResumeId) {
+                formData.append('resume_id', window.latestResumeId);
+            }
 
             try {
                 const response = await fetch('/extract', { method: 'POST', body: formData });
